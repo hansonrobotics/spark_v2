@@ -41,7 +41,7 @@ The system is designed to work with ANY OpenAI-compatible LLM. It now defaults t
 ## Quickstart — Run in 60 Seconds <a name="quickstart"></a>
 
 ### Prerequisites
-- Python 3.11+
+- Python 3.10+
 - pip
 
 ### Install
