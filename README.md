@@ -494,42 +494,6 @@ Both build on: Hanson et al. (2025) "Sentience Quest" — arXiv:2505.12229
 
 ---
 
-## Notes for Vytas
-
-### Priority for First Test Run
-1. Get the server running (`uvicorn src.runtime.spark_server:app --port 8080`)
-2. Open the web UI at localhost:8080
-3. Wire in your LLM (see Swapping section above) — just need to add the API call in the WebSocket handler where the context is assembled
-4. Chat and watch the drive dashboard update in real time
-5. Wait 30+ seconds without typing — watch Sophia self-initiate
-
-### What to Watch For
-- Does the TKG accumulate meaningful quadruples?
-- Do the drives evolve naturally during conversation?
-- Does self-initiation fire at appropriate moments?
-- Does the Agape evaluator produce sensible validated rewards?
-- Do the background LLM streams enrich the dialogue context?
-
-### Known Issues
-- `sophia_live.py` line 25: `DB_PATH` is hardcoded to `/home/claude/spark_data/spark.db`. Change to a relative path like `./data/spark.db` or use an environment variable.
-- The chat UI HTML is embedded in `spark_server.py` as a string. For serious development, extract to a template file.
-- Some `__init__.py` files may be empty — that's fine, they're just for Python module resolution.
-- The `agape_algorithm.py`, `agape_function.py`, and `agape_root.py` files are earlier iterations of the Agape function. `agape_v2.py` is the current version. The earlier files are kept for reference but can be removed.
-
-### The DB_PATH Fix
-
-Before running, update `sophia_live.py` line 25:
-```python
-# Change FROM:
-DB_PATH = "/home/claude/spark_data/spark.db"
-# Change TO:
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "spark.db")
-```
-
-And similarly in `spark_server.py` line ~35.
-
----
-
 ## License
 
 Proprietary — Hanson Robotics Limited. All rights reserved.
