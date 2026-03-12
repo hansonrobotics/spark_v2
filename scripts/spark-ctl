@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPARK v2 — CLI Management Tool (spark-ctl)
+# Social Platform for AI-Robotic Knowledge
+# Hanson Robotics Limited — 2026
+# ═══════════════════════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+COMPOSE_FILE="$PROJECT_DIR/config/docker/docker-compose.yml"
+K8S_FILE="$PROJECT_DIR/config/k8s/k8s-deployment.yaml"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+VERSION="2.0.0"
+
+# ─── Helper Functions ─────────────────────────────────────────────────────────
+
+log_info()  { echo -e "${BLUE}[INFO]${NC}  $*"; }
+log_ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
+
+banner() {
+    echo -e "${CYAN}"
+    echo "  ╔══════════════════════════════════════════════════════════╗"
+    echo "  ║  SPARK v2 — Social Platform for AI-Robotic Knowledge   ║"
+    echo "  ║  Hanson Robotics Limited                                ║"
+    echo "  ║  Version: $VERSION                                        ║"
+    echo "  ╚══════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+check_deps() {
+    local missing=()
+    for cmd in docker docker-compose python3 pip3 curl; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    if [ ${#missing[@]} -ne 0 ]; then
+        log_error "Missing dependencies: ${missing[*]}"
+        echo "Please install them and try again."
+        exit 1
+    fi
+    log_ok "All dependencies found"
+}
+
+# ─── Commands ─────────────────────────────────────────────────────────────────
+
+cmd_install() {
+    banner
+    log_info "Installing SPARK v2..."
+
+    # Check dependencies
+    check_deps
+
+    # Install Python dependencies
+    log_info "Installing Python dependencies..."
+    pip3 install -r "$PROJECT_DIR/requirements.txt" --break-system-packages 2>/dev/null || \
+    pip3 install -r "$PROJECT_DIR/requirements.txt"
+    log_ok "Python dependencies installed"
+
+    # Create data directories
+    log_info "Creating data directories..."
+    mkdir -p "$PROJECT_DIR/data/autoresearch"/{experiments,programs,results}
+    mkdir -p "$PROJECT_DIR/data/neo4j"
+    mkdir -p "$PROJECT_DIR/data/timescale"
+    mkdir -p "$PROJECT_DIR/data/minio"
+    log_ok "Data directories created"
+
+    # Build Docker images
+    log_info "Building Docker images..."
+    docker-compose -f "$COMPOSE_FILE" build
+    log_ok "Docker images built"
+
+    # Initialize program.md files
+    log_info "Initializing autoresearch programs..."
+    python3 -c "
+from src.autoresearch.autoresearch_service import PROGRAM_TEMPLATES, SubsystemTarget
+import os
+prog_dir = '$PROJECT_DIR/data/autoresearch/programs'
+os.makedirs(prog_dir, exist_ok=True)
+for target, content in PROGRAM_TEMPLATES.items():
+    filepath = os.path.join(prog_dir, f'{target.value}_program.md')
+    with open(filepath, 'w') as f:
+        f.write(content)
+    print(f'  Created: {filepath}')
+" 2>/dev/null || log_warn "Skipped program initialization (run from project root)"
+    log_ok "Installation complete!"
+    echo ""
+    echo "  Next steps:"
+    echo "    spark-ctl start       # Start all services"
+    echo "    spark-ctl status      # Check service health"
+    echo "    spark-ctl test        # Run test suite"
+}
+
+cmd_start() {
+    banner
+    log_info "Starting SPARK v2 services..."
+    docker-compose -f "$COMPOSE_FILE" up -d
+    log_ok "All services started"
+    echo ""
+    echo "  Services:"
+    echo "    API Gateway:     http://localhost:8000"
+    echo "    API Docs:        http://localhost:8000/docs"
+    echo "    Knowledge Graph: http://localhost:8001"
+    echo "    HTN Planner:     http://localhost:8002"
+    echo "    Story Engine:    http://localhost:8003"
+    echo "    Robot Interface: http://localhost:8006"
+    echo "    Autoresearch:    http://localhost:8007"
+    echo "    Neo4j Browser:   http://localhost:7474"
+    echo "    RabbitMQ:        http://localhost:15672"
+    echo "    Grafana:         http://localhost:3000"
+    echo "    MLflow:          http://localhost:5000"
+}
+
+cmd_stop() {
+    log_info "Stopping SPARK v2 services..."
+    docker-compose -f "$COMPOSE_FILE" down
+    log_ok "All services stopped"
+}
+
+cmd_restart() {
+    cmd_stop
+    sleep 2
+    cmd_start
+}
+
+cmd_status() {
+    banner
+    log_info "Checking service health..."
+    echo ""
+
+    services=("spark-api:8000" "spark-kg:8001" "spark-htn:8002" "spark-story:8003"
+              "spark-robot:8006" "spark-autoresearch:8007")
+
+    for svc in "${services[@]}"; do
+        name="${svc%%:*}"
+        port="${svc##*:}"
+        if curl -sf "http://localhost:$port/health" > /dev/null 2>&1; then
+            log_ok "$name (port $port): healthy"
+        else
+            log_error "$name (port $port): unreachable"
+        fi
+    done
+
+    echo ""
+    # Infrastructure
+    infra=("neo4j:7474" "redis:6379" "rabbitmq:15672")
+    for svc in "${infra[@]}"; do
+        name="${svc%%:*}"
+        port="${svc##*:}"
+        if curl -sf "http://localhost:$port" > /dev/null 2>&1 || \
+           docker-compose -f "$COMPOSE_FILE" ps "$name" 2>/dev/null | grep -q "Up"; then
+            log_ok "$name (port $port): running"
+        else
+            log_warn "$name (port $port): not detected"
+        fi
+    done
+}
+
+cmd_test() {
+    banner
+    local test_type="${1:-all}"
+
+    case "$test_type" in
+        unit|--unit)
+            log_info "Running unit tests..."
+            cd "$PROJECT_DIR"
+            python3 -m pytest tests/ -v --tb=short -k "not Integration and not System" \
+                --cov=src --cov-report=term-missing
+            ;;
+        integration|--integration)
+            log_info "Running integration tests..."
+            cd "$PROJECT_DIR"
+            python3 -m pytest tests/ -v --tb=short -k "Integration"
+            ;;
+        system|--system)
+            log_info "Running system tests..."
+            cd "$PROJECT_DIR"
+            python3 -m pytest tests/ -v --tb=short -k "System"
+            ;;
+        all|--all)
+            log_info "Running full test suite..."
+            cd "$PROJECT_DIR"
+            python3 -m pytest tests/ -v --tb=short --cov=src --cov-report=term-missing
+            ;;
+        *)
+            log_error "Unknown test type: $test_type"
+            echo "Usage: spark-ctl test [unit|integration|system|all]"
+            ;;
+    esac
+}
+
+cmd_autoresearch() {
+    local action="${1:-status}"
+    local subsystem="${2:-all}"
+
+    case "$action" in
+        start)
+            log_info "Starting autoresearch for: $subsystem"
+            if [ "$subsystem" = "all" ]; then
+                curl -s -X POST "http://localhost:8007/run-all?num_experiments_per=10" | python3 -m json.tool
+            else
+                curl -s -X POST "http://localhost:8007/run" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"subsystem\": \"$subsystem\", \"num_experiments\": 10}" | python3 -m json.tool
+            fi
+            ;;
+        status)
+            log_info "Autoresearch status:"
+            curl -s "http://localhost:8007/status" | python3 -m json.tool
+            ;;
+        results)
+            log_info "Autoresearch meta-results:"
+            curl -s "http://localhost:8007/meta/results" | python3 -m json.tool
+            ;;
+        program)
+            log_info "Program for $subsystem:"
+            curl -s "http://localhost:8007/programs/$subsystem" | python3 -m json.tool
+            ;;
+        *)
+            echo "Usage: spark-ctl autoresearch [start|status|results|program] [subsystem]"
+            ;;
+    esac
+}
+
+cmd_logs() {
+    local service="${1:-spark-api}"
+    docker-compose -f "$COMPOSE_FILE" logs -f "$service"
+}
+
+cmd_ui() {
+    log_info "Launching SPARK v2 Web UI..."
+    echo "  API Docs:   http://localhost:8000/docs"
+    echo "  Grafana:    http://localhost:3000  (admin/spark_admin)"
+    echo "  Neo4j:      http://localhost:7474  (neo4j/spark_password)"
+    echo "  RabbitMQ:   http://localhost:15672 (spark/spark_password)"
+    echo "  MLflow:     http://localhost:5000"
+
+    # Open browser if possible
+    if command -v xdg-open &>/dev/null; then
+        xdg-open "http://localhost:8000/docs"
+    elif command -v open &>/dev/null; then
+        open "http://localhost:8000/docs"
+    fi
+}
+
+cmd_backup() {
+    local backup_dir="$PROJECT_DIR/backups/$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$backup_dir"
+    log_info "Backing up to $backup_dir..."
+
+    # Export Neo4j
+    docker-compose -f "$COMPOSE_FILE" exec -T neo4j neo4j-admin database dump neo4j \
+        --to-path=/tmp/backup 2>/dev/null && \
+        docker cp "$(docker-compose -f "$COMPOSE_FILE" ps -q neo4j)":/tmp/backup/neo4j.dump \
+        "$backup_dir/neo4j.dump" 2>/dev/null || log_warn "Neo4j backup skipped"
+
+    # Copy autoresearch data
+    cp -r "$PROJECT_DIR/data/autoresearch" "$backup_dir/autoresearch" 2>/dev/null || true
+
+    log_ok "Backup complete: $backup_dir"
+}
+
+cmd_k8s_deploy() {
+    banner
+    log_info "Deploying SPARK v2 to Kubernetes..."
+    kubectl apply -f "$K8S_FILE"
+    log_ok "Kubernetes deployment initiated"
+    echo "  Monitor with: kubectl get pods -n spark -w"
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+cmd_help() {
+    banner
+    echo "Usage: spark-ctl <command> [options]"
+    echo ""
+    echo "Commands:"
+    echo "  install                   Full installation with dependency checks"
+    echo "  start                     Start all services (Docker Compose)"
+    echo "  stop                      Stop all services"
+    echo "  restart                   Restart all services"
+    echo "  status                    Health check all services"
+    echo "  test [type]               Run tests (unit|integration|system|all)"
+    echo "  autoresearch <action>     Manage autoresearch (start|status|results|program)"
+    echo "  logs [service]            View service logs"
+    echo "  ui                        Launch web management UI"
+    echo "  backup                    Backup all data"
+    echo "  k8s-deploy                Deploy to Kubernetes"
+    echo "  help                      Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  spark-ctl install"
+    echo "  spark-ctl start"
+    echo "  spark-ctl test unit"
+    echo "  spark-ctl autoresearch start tkg_embeddings"
+    echo "  spark-ctl autoresearch status"
+    echo "  spark-ctl logs spark-kg"
+}
+
+case "${1:-help}" in
+    install)        cmd_install ;;
+    start)          cmd_start ;;
+    stop)           cmd_stop ;;
+    restart)        cmd_restart ;;
+    status)         cmd_status ;;
+    test)           cmd_test "${2:-all}" ;;
+    autoresearch)   cmd_autoresearch "${2:-status}" "${3:-all}" ;;
+    logs)           cmd_logs "${2:-spark-api}" ;;
+    ui)             cmd_ui ;;
+    backup)         cmd_backup ;;
+    k8s-deploy)     cmd_k8s_deploy ;;
+    help|--help|-h) cmd_help ;;
+    *)              log_error "Unknown command: $1"; cmd_help; exit 1 ;;
+esac

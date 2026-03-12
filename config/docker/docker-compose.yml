@@ -1,0 +1,194 @@
+version: "3.9"
+
+services:
+  # ─── Infrastructure ──────────────────────────────────────────
+  neo4j:
+    image: neo4j:5-community
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/spark_password
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD", "neo4j", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: spark
+      POSTGRES_PASSWORD: spark_password
+      POSTGRES_DB: spark_metrics
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: spark
+      RABBITMQ_DEFAULT_PASS: spark_password
+
+  minio:
+    image: minio/minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: spark_admin
+      MINIO_ROOT_PASSWORD: spark_password
+    volumes:
+      - minio_data:/data
+
+  # ─── Monitoring ──────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: spark_admin
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    ports:
+      - "5000:5000"
+    command: mlflow server --host 0.0.0.0 --port 5000
+    environment:
+      MLFLOW_TRACKING_URI: "sqlite:///mlflow.db"
+
+  # ─── SPARK Services ─────────────────────────────────────────
+  spark-kg:
+    build:
+      context: ../..
+      dockerfile: config/docker/Dockerfile.service
+    command: uvicorn src.knowledge_graph.temporal_kg_service:app --host 0.0.0.0 --port 8001 --reload
+    ports:
+      - "8001:8001"
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: spark_password
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../../src:/app/src
+
+  spark-htn:
+    build:
+      context: ../..
+      dockerfile: config/docker/Dockerfile.service
+    command: uvicorn src.htn_planner.htn_service:app --host 0.0.0.0 --port 8002 --reload
+    ports:
+      - "8002:8002"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      KG_URL: http://spark-kg:8001
+    depends_on:
+      - spark-kg
+    volumes:
+      - ../../src:/app/src
+
+  spark-story:
+    build:
+      context: ../..
+      dockerfile: config/docker/Dockerfile.service
+    command: uvicorn src.story_engine.story_service:app --host 0.0.0.0 --port 8003 --reload
+    ports:
+      - "8003:8003"
+    environment:
+      HTN_URL: http://spark-htn:8002
+      KG_URL: http://spark-kg:8001
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      - spark-kg
+      - spark-htn
+    volumes:
+      - ../../src:/app/src
+
+  spark-robot:
+    build:
+      context: ../..
+      dockerfile: config/docker/Dockerfile.service
+    command: uvicorn src.robot_interface.robot_service:app --host 0.0.0.0 --port 8006 --reload
+    ports:
+      - "8006:8006"
+    environment:
+      KG_URL: http://spark-kg:8001
+      ROBOT_MODE: simulation
+    depends_on:
+      - spark-kg
+    volumes:
+      - ../../src:/app/src
+
+  spark-autoresearch:
+    build:
+      context: ../..
+      dockerfile: config/docker/Dockerfile.service
+    command: uvicorn src.autoresearch.autoresearch_service:app --host 0.0.0.0 --port 8007 --reload
+    ports:
+      - "8007:8007"
+    environment:
+      EXPERIMENTS_DIR: /data/autoresearch/experiments
+      PROGRAMS_DIR: /data/autoresearch/programs
+      RESULTS_DIR: /data/autoresearch/results
+    volumes:
+      - ../../src:/app/src
+      - autoresearch_data:/data/autoresearch
+
+  # ─── API Gateway ────────────────────────────────────────────
+  spark-api:
+    build:
+      context: ../..
+      dockerfile: config/docker/Dockerfile.service
+    command: uvicorn src.api.gateway:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    environment:
+      KG_URL: http://spark-kg:8001
+      HTN_URL: http://spark-htn:8002
+      STORY_URL: http://spark-story:8003
+      ROBOT_URL: http://spark-robot:8006
+      AUTORESEARCH_URL: http://spark-autoresearch:8007
+    depends_on:
+      - spark-kg
+      - spark-htn
+      - spark-story
+      - spark-robot
+      - spark-autoresearch
+    volumes:
+      - ../../src:/app/src
+
+volumes:
+  neo4j_data:
+  timescale_data:
+  minio_data:
+  autoresearch_data:

@@ -1,0 +1,393 @@
+# SPARK v2 Kubernetes Deployment Configuration
+# Deploy with: kubectl apply -f k8s-deployment.yaml
+
+---
+# Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spark
+---
+# Neo4j StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: neo4j
+  namespace: spark
+spec:
+  serviceName: neo4j
+  replicas: 1
+  selector:
+    matchLabels:
+      app: neo4j
+  template:
+    metadata:
+      labels:
+        app: neo4j
+    spec:
+      containers:
+      - name: neo4j
+        image: neo4j:5-community
+        ports:
+        - containerPort: 7474
+        - containerPort: 7687
+        env:
+        - name: NEO4J_AUTH
+          value: "neo4j/spark_password"
+        volumeMounts:
+        - name: neo4j-data
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: neo4j-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: neo4j
+  namespace: spark
+spec:
+  selector:
+    app: neo4j
+  ports:
+  - name: http
+    port: 7474
+  - name: bolt
+    port: 7687
+---
+# Redis
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: spark
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: spark
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+---
+# SPARK API Gateway
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-api
+  namespace: spark
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: spark-api
+  template:
+    metadata:
+      labels:
+        app: spark-api
+    spec:
+      containers:
+      - name: spark-api
+        image: hansonrobotics/spark-v2:latest
+        command: ["uvicorn", "src.api.gateway:app", "--host", "0.0.0.0", "--port", "8000"]
+        ports:
+        - containerPort: 8000
+        env:
+        - name: KG_URL
+          value: "http://spark-kg:8001"
+        - name: HTN_URL
+          value: "http://spark-htn:8002"
+        - name: STORY_URL
+          value: "http://spark-story:8003"
+        - name: ROBOT_URL
+          value: "http://spark-robot:8006"
+        - name: AUTORESEARCH_URL
+          value: "http://spark-autoresearch:8007"
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-api
+  namespace: spark
+spec:
+  type: LoadBalancer
+  selector:
+    app: spark-api
+  ports:
+  - port: 8000
+    targetPort: 8000
+---
+# SPARK Knowledge Graph Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-kg
+  namespace: spark
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: spark-kg
+  template:
+    metadata:
+      labels:
+        app: spark-kg
+    spec:
+      containers:
+      - name: spark-kg
+        image: hansonrobotics/spark-v2:latest
+        command: ["uvicorn", "src.knowledge_graph.temporal_kg_service:app", "--host", "0.0.0.0", "--port", "8001"]
+        ports:
+        - containerPort: 8001
+        env:
+        - name: NEO4J_URI
+          value: "bolt://neo4j:7687"
+        - name: NEO4J_USER
+          value: "neo4j"
+        - name: NEO4J_PASSWORD
+          value: "spark_password"
+        - name: REDIS_URL
+          value: "redis://redis:6379"
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-kg
+  namespace: spark
+spec:
+  selector:
+    app: spark-kg
+  ports:
+  - port: 8001
+---
+# SPARK HTN Planner
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-htn
+  namespace: spark
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spark-htn
+  template:
+    metadata:
+      labels:
+        app: spark-htn
+    spec:
+      containers:
+      - name: spark-htn
+        image: hansonrobotics/spark-v2:latest
+        command: ["uvicorn", "src.htn_planner.htn_service:app", "--host", "0.0.0.0", "--port", "8002"]
+        ports:
+        - containerPort: 8002
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-htn
+  namespace: spark
+spec:
+  selector:
+    app: spark-htn
+  ports:
+  - port: 8002
+---
+# SPARK Story Engine
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-story
+  namespace: spark
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spark-story
+  template:
+    metadata:
+      labels:
+        app: spark-story
+    spec:
+      containers:
+      - name: spark-story
+        image: hansonrobotics/spark-v2:latest
+        command: ["uvicorn", "src.story_engine.story_service:app", "--host", "0.0.0.0", "--port", "8003"]
+        ports:
+        - containerPort: 8003
+        env:
+        - name: HTN_URL
+          value: "http://spark-htn:8002"
+        - name: KG_URL
+          value: "http://spark-kg:8001"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-story
+  namespace: spark
+spec:
+  selector:
+    app: spark-story
+  ports:
+  - port: 8003
+---
+# SPARK Robot Interface
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-robot
+  namespace: spark
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spark-robot
+  template:
+    metadata:
+      labels:
+        app: spark-robot
+    spec:
+      containers:
+      - name: spark-robot
+        image: hansonrobotics/spark-v2:latest
+        command: ["uvicorn", "src.robot_interface.robot_service:app", "--host", "0.0.0.0", "--port", "8006"]
+        ports:
+        - containerPort: 8006
+        env:
+        - name: KG_URL
+          value: "http://spark-kg:8001"
+        - name: ROBOT_MODE
+          value: "simulation"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-robot
+  namespace: spark
+spec:
+  selector:
+    app: spark-robot
+  ports:
+  - port: 8006
+---
+# SPARK Autoresearch (GPU-enabled)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-autoresearch
+  namespace: spark
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spark-autoresearch
+  template:
+    metadata:
+      labels:
+        app: spark-autoresearch
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      containers:
+      - name: spark-autoresearch
+        image: hansonrobotics/spark-v2:latest
+        command: ["uvicorn", "src.autoresearch.autoresearch_service:app", "--host", "0.0.0.0", "--port", "8007"]
+        ports:
+        - containerPort: 8007
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+        volumeMounts:
+        - name: autoresearch-data
+          mountPath: /data/autoresearch
+      volumes:
+      - name: autoresearch-data
+        persistentVolumeClaim:
+          claimName: autoresearch-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-autoresearch
+  namespace: spark
+spec:
+  selector:
+    app: spark-autoresearch
+  ports:
+  - port: 8007
+---
+# PVC for autoresearch experiments
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: autoresearch-pvc
+  namespace: spark
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+---
+# HorizontalPodAutoscaler for API Gateway
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: spark-api-hpa
+  namespace: spark
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: spark-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
