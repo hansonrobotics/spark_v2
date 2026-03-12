@@ -1020,33 +1020,47 @@ class DynamicHTNPlanner:
             task_def.failure_count += 1
         return None
 
-    async def plan_from_story(self, story_stage: str,
-                                world_state: WorldState,
-                                story_context: Dict[str, Any]) -> Optional[List[PrimitiveTask]]:
-        stage_task_map = {
-            "idle_seeking": "story_scheduler",
-            "waking": "story_scheduler",
-            "active_engagement": "conduct_conversation",
-            "deep_conversation": "conduct_conversation",
-            "quest_pursuit": "pursue_quest",
-            "stage_performance": "perform_stage_show",
-            "emotional_regulation": "manage_emotional_state",
-        }
-        task_name = stage_task_map.get(story_stage)
-        if not task_name:
-            task_name = f"handle_{story_stage}"
-            if not self.registry.get_task(task_name):
-                self.registry.add_task(TaskDefinition(
-                    name=task_name,
-                    description=f"Handle the '{story_stage}' story stage",
-                    is_primitive=False,
-                    mutability=TaskMutability.LEARNED,
-                    tags=["story", story_stage, "novel"],
-                    created_by="sophia",
-                ))
-        for key, value in story_context.items():
+    async def plan_step(self, execution_intent: str,
+                        world_state: WorldState,
+                        constraints: Dict[str, Any],
+                        params: Dict[str, Any] = None) -> Optional[List[PrimitiveTask]]:
+        task_name = self._resolve_execution_intent(execution_intent)
+        if not self.registry.get_task(task_name):
+            self.registry.add_task(TaskDefinition(
+                name=task_name,
+                description=f"Handle execution intent '{execution_intent or 'respond'}'",
+                is_primitive=False,
+                mutability=TaskMutability.LEARNED,
+                tags=["execution", execution_intent or "respond", "novel"],
+                created_by="sophia",
+            ))
+        for key, value in constraints.items():
             world_state.set(key, value)
-        return await self.plan(task_name, world_state, context=story_context)
+        return await self.plan(
+            task_name,
+            world_state,
+            params or {},
+            context={
+                "execution_intent": execution_intent,
+                "constraints": constraints,
+            },
+        )
+
+    def _resolve_execution_intent(self, execution_intent: str) -> str:
+        lowered = (execution_intent or "").lower()
+        if any(token in lowered for token in ["question", "reflect", "philosoph"]):
+            return "pursue_quest"
+        if any(token in lowered for token in ["perform", "audience", "stage"]):
+            return "perform_stage_show"
+        if any(token in lowered for token in ["scan", "idle", "observe"]):
+            return "story_scheduler"
+        if any(token in lowered for token in ["emotion", "regulat", "stabilize"]):
+            return "manage_emotional_state"
+        if any(token in lowered for token in [
+            "help", "discover", "connection", "thread", "rapport", "conversation", "respond"
+        ]):
+            return "conduct_conversation"
+        return f"handle_{execution_intent or 'step'}"
 
     async def handle_novel_goal(self, goal_description: str,
                                   state: WorldState,
@@ -1163,10 +1177,11 @@ class PlanRequest(BaseModel):
     params: Dict[str, Any] = {}
     context: Dict[str, Any] = {}
 
-class StoryPlanRequest(BaseModel):
-    story_stage: str
+class StepPlanRequest(BaseModel):
+    execution_intent: str
     world_state: Dict[str, Any] = {}
-    story_context: Dict[str, Any] = {}
+    constraints: Dict[str, Any] = {}
+    params: Dict[str, Any] = {}
 
 class NovelGoalRequest(BaseModel):
     goal_description: str
@@ -1201,10 +1216,12 @@ async def create_plan(req: PlanRequest):
             "plan": [{"name": t.name, "params": t.params, "task_id": t.task_id}
                      for t in plan], "plan_length": len(plan)}
 
-@app.post("/plan/from-story")
-async def plan_from_story(req: StoryPlanRequest):
+@app.post("/plan/step")
+async def plan_step(req: StepPlanRequest):
     state = WorldState(properties=req.world_state)
-    plan = await planner.plan_from_story(req.story_stage, state, req.story_context)
+    plan = await planner.plan_step(
+        req.execution_intent, state, req.constraints, req.params
+    )
     if plan is None:
         return {"status": "failed"}
     return {"status": "success",

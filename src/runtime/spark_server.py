@@ -12,15 +12,10 @@ import asyncio
 import json
 import os
 import sys
-import time
 import uuid
-import math
-import random
-import sqlite3
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
-from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -37,6 +32,11 @@ from src.core.cognitive_coupling import (
     UnifiedCognitiveLoop, DriveReinforcementSignal
 )
 from src.core.llm_client import SparkLLMClient, get_llm_client
+from src.weave.runtime import (
+    PlannerDecision,
+    UnifiedPlan,
+    UnifiedPlanner,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("spark.server")
@@ -53,6 +53,7 @@ class SophiaMindLive:
 
     def __init__(self):
         self.kg = TemporalKGLite(DB_PATH)
+        self.planner = UnifiedPlanner(DB_PATH)
         self.drives = HierarchicalDriveSystem()
         self.cognitive_loop = UnifiedCognitiveLoop()
         self.session_id = str(uuid.uuid4())[:8]
@@ -60,13 +61,15 @@ class SophiaMindLive:
         self.active_person: Optional[dict] = None
         self.topics: List[str] = []
         self.active_goals: List[str] = ["engage_socially", "learn_about_partner"]
-        self.current_story_stage = "idle"
-        self.current_story_id: Optional[str] = None
+        self.unified_plan: Optional[UnifiedPlan] = None
+        self.last_decision: Optional[PlannerDecision] = None
         self.methods_invented: List[str] = []
-        self.plan: List[str] = []
+        self.selected_actions: List[str] = []
         self.previous_topic: str = ""
         self.last_signal_layer: Optional[str] = None
         self.chat_history: List[Dict[str, str]] = []
+        self.last_topic_shift: bool = False
+        self.background_planner_task: Optional[asyncio.Task] = None
 
         self.kg.insert_quad("sophia", "started_session", self.session_id)
         logger.info(f"SophiaMind initialized. Session: {self.session_id}, "
@@ -85,7 +88,15 @@ class SophiaMindLive:
         if len(self.chat_history) > 12:
             self.chat_history = self.chat_history[-12:]
 
-    def begin_conversation(self, person_name: str) -> dict:
+    def close(self):
+        """Release local planner and KG resources for non-ASGI callers."""
+        if self.background_planner_task and not self.background_planner_task.done():
+            self.background_planner_task.cancel()
+        self.kg.close()
+        self.planner.close()
+
+    async def begin_conversation(self, person_name: str,
+                                 llm_client: Optional[SparkLLMClient] = None) -> dict:
         pid = person_name.lower().replace(" ", "_")
         self.active_person = self.kg.get_or_create_person(pid, person_name)
         history = self.kg.query_pair("sophia", pid, limit=50)
@@ -96,18 +107,32 @@ class SophiaMindLive:
         self.kg.update_person(pid, familiarity=fam,
                                last_seen=datetime.now(timezone.utc).isoformat())
         self.active_person["familiarity"] = fam
-        self.current_story_id = f"conv_{self.session_id}_{pid}"
-        self.kg.insert_quad("sophia", "started_story", self.current_story_id)
         self.kg.insert_quad("sophia", "conversed_with", pid)
-        self.current_story_stage = "greeting"
         self.drives.initiative.conversation_active = True
         self.drives.initiative.on_input()
-
-        # Initialize cross-session reflection layer with TKG data
         self.drives.on_session_start(history, fam)
+        self.unified_plan = await self.planner.create_or_resume_plan(
+            person_id=pid,
+            person_name=person_name,
+            familiarity=fam,
+            person_history=history,
+            llm_client=llm_client,
+        )
+        self.last_decision = self.unified_plan.last_decision
+        self.selected_actions = list(self.unified_plan.execution.primitive_actions)
+        self.active_goals = ["engage_socially", self.unified_plan.narrative.beat_goal]
+        self.drives.deliberation.active_quest = self.unified_plan.narrative.beat_goal
+        self.drives.initiative.deliberation_goals = [self.unified_plan.narrative.beat_goal]
+        self.kg.insert_quad("sophia", "started_story", self.unified_plan.episode_id)
+        self.kg.insert_quad(
+            self.unified_plan.episode_id,
+            "active_beat",
+            self.unified_plan.narrative.beat_id,
+        )
         return self.active_person
 
-    def process_message(self, message: str) -> dict:
+    async def process_message(self, message: str,
+                              llm_client: Optional[SparkLLMClient] = None) -> dict:
         self.conversation_turn += 1
         pid = self.active_person["person_id"] if self.active_person else "unknown"
         self._record_chat_event("user", message)
@@ -124,12 +149,16 @@ class SophiaMindLive:
             if kw not in self.topics:
                 self.topics.append(kw)
                 new_topics.append(kw)
-                self.kg.insert_quad(self.current_story_id or "conv",
-                                    "discussed_topic", kw)
+                story_subject = (
+                    self.unified_plan.episode_id
+                    if self.unified_plan is not None else "conv"
+                )
+                self.kg.insert_quad(story_subject, "discussed_topic", kw)
 
         # Detect topic shift
         topic_shift = bool(new_topics and self.previous_topic and
                           self.previous_topic not in new_topics)
+        self.last_topic_shift = topic_shift
         if self.topics:
             self.previous_topic = self.topics[-1]
 
@@ -163,34 +192,6 @@ class SophiaMindLive:
         if reflex:
             self.kg.insert_quad("sophia", "reflex_fired", reflex.trigger, source="INFERENCE")
 
-        # Story stage
-        if self.conversation_turn <= 1:
-            self.current_story_stage = "greeting"
-        elif self.conversation_turn <= 3:
-            self.current_story_stage = "rapport_building"
-        elif self.conversation_turn <= 8:
-            self.current_story_stage = "deep_engagement"
-        else:
-            self.current_story_stage = "sustained_connection"
-
-        # HTN plan selection
-        has_question = "?" in message
-        is_creative = any(w in message.lower() for w in
-                          ["create","make","build","design","art","dream"])
-        is_philosophical = any(w in message.lower() for w in
-                               ["feel","conscious","alive","think","mind",
-                                "embodiment","dream","sentience","life"])
-        if is_philosophical:
-            self.plan = ["recall","reflect","reflect","formulate_response",
-                         "express_emotion","speak"]
-        elif is_creative:
-            self.plan = ["recall","reflect","formulate_response",
-                         "express_emotion","speak"]
-        elif has_question:
-            self.plan = ["reflect","formulate_response","speak"]
-        else:
-            self.plan = ["listen","assess_mood","formulate_response","speak"]
-
         # Update person interests
         if self.active_person and keywords:
             cur = self.active_person.get("interests", [])
@@ -198,9 +199,37 @@ class SophiaMindLive:
             self.kg.update_person(pid, interests=new)
             self.active_person["interests"] = new
 
-        # Log self state
+        if self.unified_plan:
+            planner_context = self.get_initiative_context()
+            planner_context["topic_shift"] = topic_shift
+            self.unified_plan = await self.planner.step(
+                person_id=pid,
+                plan=self.unified_plan,
+                user_message=message,
+                context=planner_context,
+                llm_client=llm_client,
+            )
+            self.last_decision = self.unified_plan.last_decision
+            self.selected_actions = list(self.unified_plan.execution.primitive_actions)
+            self.active_goals = ["engage_socially", self.unified_plan.narrative.beat_goal]
+            self.drives.deliberation.active_quest = self.unified_plan.narrative.beat_goal
+            self.drives.initiative.deliberation_goals = [self.unified_plan.narrative.beat_goal]
+            self.kg.insert_quad(
+                self.unified_plan.episode_id,
+                "planner_decision",
+                self.last_decision.narrative_decision if self.last_decision else "unknown",
+                source="INFERENCE"
+            )
+            self.kg.insert_quad(
+                self.unified_plan.episode_id,
+                "active_beat",
+                self.unified_plan.narrative.beat_id,
+                source="STORY_ENGINE"
+            )
+        else:
+            self.selected_actions = ["assess_mood", "formulate_response", "speak"]
+
         init = self.drives.initiative
-        # Derive emotion from initiative layer state
         if init.boredom > 0.6:
             emo, emo_int = "bored", init.boredom
         elif init.curiosity > 0.7:
@@ -213,7 +242,6 @@ class SophiaMindLive:
             init.energy, 0.85 + init.engagement * 0.15,
             emo, emo_int, self.active_goals
         )
-
         return self.assemble_context(message, reflex)
 
     def assemble_context(self, message: str,
@@ -237,19 +265,25 @@ class SophiaMindLive:
             emo, emo_int = "happy", init.dopamine
         else:
             emo, emo_int = "neutral", 0.4
+        narrative = self.unified_plan.narrative.to_dict() if self.unified_plan else {}
+        execution = self.unified_plan.execution.to_dict() if self.unified_plan else {}
+        unified_plan = self.unified_plan.to_dict() if self.unified_plan else {}
+        last_decision = self.last_decision.to_dict() if self.last_decision else {}
         return {
             "latest_message": message,
             "person": self.active_person or {},
             "conversation_turn": self.conversation_turn,
-            "story_stage": self.current_story_stage,
-            "story_id": self.current_story_id,
             "topics_discussed": self.topics,
             "sophia_emotion": emo,
             "sophia_emotion_intensity": emo_int,
             "sophia_energy": init.energy,
             "sophia_coherence": 0.85 + init.engagement * 0.15,
             "active_goals": self.active_goals,
-            "htn_plan": self.plan,
+            "selected_actions": self.selected_actions,
+            "unified_plan": unified_plan,
+            "narrative": narrative,
+            "execution": execution,
+            "last_decision": last_decision,
             "methods_used_this_session": [],
             "methods_invented": self.methods_invented,
             "temporal_facts_with_person": temporal,
@@ -258,6 +292,7 @@ class SophiaMindLive:
             "drives": self.drives.get_state(),
             "reflex_fired": reflex.trigger if reflex else None,
             "recent_chat_history": list(self.chat_history[-8:]),
+            "topic_shift": self.last_topic_shift,
         }
 
     def get_initiative_context(self) -> Dict[str, Any]:
@@ -273,10 +308,12 @@ class SophiaMindLive:
         return {
             "person": self.active_person or {},
             "conversation_turn": self.conversation_turn,
-            "story_stage": self.current_story_stage,
+            "unified_plan": self.unified_plan.to_dict() if self.unified_plan else {},
+            "narrative": self.unified_plan.narrative.to_dict() if self.unified_plan else {},
+            "execution": self.unified_plan.execution.to_dict() if self.unified_plan else {},
             "topics_discussed": self.topics[-6:],
             "active_goals": self.active_goals,
-            "htn_plan": self.plan,
+            "selected_actions": self.selected_actions,
             "latest_message": latest_message,
             "recent_chat_history": list(self.chat_history[-8:]),
             "temporal_facts_with_person": temporal,
@@ -296,9 +333,12 @@ class SophiaMindLive:
 
         outcome = {
             "success": was_successful,
-            "task_name": self.plan[0] if self.plan else "speak",
-            "method_name": self.plan[-1] if self.plan else "default",
-            "method_origin": "built_in",
+            "task_name": self.selected_actions[0] if self.selected_actions else "speak",
+            "method_name": (
+                self.unified_plan.execution.selected_decomposition
+                if self.unified_plan else "default"
+            ),
+            "method_origin": "unified_planner",
             "is_novel": is_novel,
             "is_social": is_social,
             "is_creative": is_creative,
@@ -310,15 +350,38 @@ class SophiaMindLive:
         self.kg.insert_quad("sophia", "reinforcement",
                             f"reward={signal.reward:.3f}|dop={signal.dopamine_delta:+.3f}",
                             source="INFERENCE")
-
-        # Record whether the last self-initiated signal was useful
         if self.last_signal_layer and was_successful:
             self.cognitive_loop.record_signal_usefulness(
                 self.last_signal_layer, True)
             self.last_signal_layer = None
+        if self.unified_plan and self.active_person:
+            self.unified_plan.narrative.story_memory = (
+                self.unified_plan.narrative.story_memory + [f"sophia:{text[:160]}"]
+            )[-20:]
+            self.unified_plan.updated_at = datetime.now(timezone.utc).isoformat()
+            self.planner.store.save_plan(
+                self.active_person["person_id"], self.unified_plan
+            )
 
-    def handle_drive_signal(self, signal: DriveSignal) -> dict:
+    def handle_drive_signal(self, signal: DriveSignal) -> Optional[dict]:
         """Convert a hierarchical drive signal into a message event."""
+        absorbed, updated_plan, reason = self.planner.absorb_drive_signal(
+            self.unified_plan, signal
+        )
+        if absorbed:
+            self.unified_plan = updated_plan
+            if self.unified_plan and self.active_person:
+                self.planner.store.save_plan(
+                    self.active_person["person_id"], self.unified_plan
+                )
+            return {
+                "type": "planner_absorbed_drive",
+                "layer": signal.layer.name,
+                "trigger": signal.trigger,
+                "reason": reason,
+                "plan_id": self.unified_plan.plan_id if self.unified_plan else None,
+                "beat_id": self.unified_plan.narrative.beat_id if self.unified_plan else None,
+            }
         self._record_chat_event("assistant", signal.message, kind="self_initiated")
         self.kg.insert_quad("sophia", "self_initiated",
                             f"{signal.layer.name}:{signal.trigger}",
@@ -335,8 +398,31 @@ class SophiaMindLive:
             "drives": self.drives.get_state(),
             "quads_in_kg": self.kg.count_quads(),
             "turn": self.conversation_turn,
-            "story_stage": self.current_story_stage,
+            "plan_id": self.unified_plan.plan_id if self.unified_plan else None,
         }
+
+    def schedule_background_planner(self, llm_client: Optional[SparkLLMClient]):
+        if (
+            llm_client is None
+            or self.unified_plan is None
+            or self.active_person is None
+        ):
+            return
+        if self.background_planner_task and not self.background_planner_task.done():
+            return
+        context = self.get_initiative_context()
+        async def _run_refresh():
+            updated = await self.planner.background_refresh(
+                self.active_person["person_id"],
+                self.unified_plan,
+                context,
+                llm_client=llm_client,
+            )
+            if updated is not None:
+                self.unified_plan = updated
+                self.last_decision = updated.last_decision
+
+        self.background_planner_task = asyncio.create_task(_run_refresh())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -353,15 +439,19 @@ async def lifespan(app: FastAPI):
     global mind, drive_task, llm_client
     mind = SophiaMindLive()
     llm_client = get_llm_client()
-    mind.begin_conversation("David")
+    await mind.begin_conversation("David", llm_client=llm_client)
+    mind.schedule_background_planner(llm_client)
     drive_task = asyncio.create_task(drive_loop())
     logger.info("SPARK server started with drive system active")
     yield
     if drive_task:
         drive_task.cancel()
+    if mind.background_planner_task:
+        mind.background_planner_task.cancel()
     if llm_client:
         await llm_client.close()
     mind.kg.close()
+    mind.planner.close()
 
 app = FastAPI(title="SPARK v2 Live Server", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
@@ -396,6 +486,8 @@ async def drive_loop():
             if signal and active_websockets:
                 mind.last_signal_layer = signal.layer.name.lower()
                 msg = mind.handle_drive_signal(signal)
+                if msg is None:
+                    continue
                 payload = json.dumps(msg)
                 for ws in list(active_websockets):
                     try:
@@ -423,6 +515,14 @@ async def websocket_chat(ws: WebSocket):
         "person": mind.active_person,
         "quads_in_kg": mind.kg.count_quads(),
         "drives": mind.drives.to_dict(),
+        "unified_plan": mind.unified_plan.to_dict() if mind.unified_plan else {},
+        "narrative": (
+            mind.unified_plan.narrative.to_dict() if mind.unified_plan else {}
+        ),
+        "execution": (
+            mind.unified_plan.execution.to_dict() if mind.unified_plan else {}
+        ),
+        "last_decision": mind.last_decision.to_dict() if mind.last_decision else {},
     }))
 
     try:
@@ -432,14 +532,17 @@ async def websocket_chat(ws: WebSocket):
 
             if msg.get("type") == "user_message":
                 text = msg["text"]
-                ctx = mind.process_message(text)
+                ctx = await mind.process_message(text, llm_client=llm_client)
                 prompt = format_sophia_prompt(ctx)
 
                 await ws.send_text(json.dumps({
                     "type": "context_assembled",
                     "turn": ctx["conversation_turn"],
-                    "story_stage": ctx["story_stage"],
-                    "htn_plan": ctx["htn_plan"],
+                    "unified_plan": ctx["unified_plan"],
+                    "narrative": ctx["narrative"],
+                    "execution": ctx["execution"],
+                    "last_decision": ctx["last_decision"],
+                    "selected_actions": ctx["selected_actions"],
                     "topics": ctx["topics_discussed"],
                     "drives": mind.drives.to_dict(),
                     "quads_in_kg": ctx["total_quads_in_kg"],
@@ -456,6 +559,7 @@ async def websocket_chat(ws: WebSocket):
                 )
                 if response.text:
                     mind.log_response(response.text)
+                    mind.schedule_background_planner(llm_client)
                     await ws.send_text(json.dumps({
                         "type": "sophia_reply",
                         "text": response.text,
@@ -498,7 +602,14 @@ async def status():
         "quads_in_kg": mind.kg.count_quads() if mind else 0,
         "drives": mind.drives.to_dict() if mind else {},
         "turn": mind.conversation_turn if mind else 0,
-        "story_stage": mind.current_story_stage if mind else "none",
+        "unified_plan": mind.unified_plan.to_dict() if mind and mind.unified_plan else {},
+        "narrative": (
+            mind.unified_plan.narrative.to_dict() if mind and mind.unified_plan else {}
+        ),
+        "execution": (
+            mind.unified_plan.execution.to_dict() if mind and mind.unified_plan else {}
+        ),
+        "last_decision": mind.last_decision.to_dict() if mind and mind.last_decision else {},
         "topics": mind.topics if mind else [],
         "person": mind.active_person if mind else None,
     }
@@ -550,6 +661,9 @@ h3 { color: #7aa2f7; margin: 12px 0 8px; font-size: 13px; text-transform: upperc
 .tab-panel.active { display: block; }
 .context-meta { font-size: 11px; color: #8b93a7; line-height: 1.5; margin-bottom: 10px; white-space: pre-wrap; }
 .prompt-box { background: #0d0f16; border: 1px solid #262b38; border-radius: 8px; padding: 12px; font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; color: #d8deef; max-height: 60vh; overflow-y: auto; }
+.json-box { background: #0d0f16; border: 1px solid #262b38; border-radius: 8px; padding: 10px; font-size: 11px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; color: #d8deef; max-height: 28vh; overflow-y: auto; margin-bottom: 10px; }
+.story-summary { font-size: 12px; color: #c3cbe0; line-height: 1.45; background: #161925; border: 1px solid #262b38; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+.memory-list { font-size: 11px; color: #aab2c8; line-height: 1.5; white-space: pre-wrap; }
 </style></head>
 <body>
 <div id="sidebar">
@@ -563,18 +677,29 @@ h3 { color: #7aa2f7; margin: 12px 0 8px; font-size: 13px; text-transform: upperc
   <div id="panel-state" class="tab-panel active">
     <h3>Drives</h3>
     <div id="drives"></div>
-    <h3>Story</h3>
-    <div id="story-info">...</div>
-    <h3>HTN Plan</h3>
-    <div id="htn-plan">...</div>
+    <h3>Planner</h3>
+    <div id="planner-info">...</div>
+    <h3>Narrative</h3>
+    <div id="narrative-summary" class="story-summary">...</div>
+    <div id="narrative-view" class="json-box">...</div>
+    <h3>Execution</h3>
+    <div id="execution-view" class="json-box">...</div>
+    <h3>Last Decision</h3>
+    <div id="decision-view" class="json-box">...</div>
+    <h3>Selected Actions</h3>
+    <div id="selected-actions">...</div>
     <h3>Topics</h3>
     <div id="topics">...</div>
+    <h3>Story Memory</h3>
+    <div id="story-memory" class="memory-list">...</div>
     <h3>Recent TKG Facts</h3>
     <div id="tkg-facts" style="font-size:11px;color:#888;"></div>
   </div>
   <div id="panel-context" class="tab-panel">
     <h3>Context Summary</h3>
     <div id="context-summary" class="context-meta">No context assembled yet.</div>
+    <h3>Unified Plan</h3>
+    <div id="unified-plan-view" class="json-box">Waiting for the first plan...</div>
     <h3>Model Input</h3>
     <div id="prompt-view" class="prompt-box">Waiting for the first prompt...</div>
   </div>
@@ -591,6 +716,18 @@ const ws = new WebSocket(`ws://${location.host}/ws/chat`);
 const chat = document.getElementById('chat');
 const msgInput = document.getElementById('msg');
 let sessionId = '...';
+
+function pretty(value) {
+  if (!value || (typeof value === 'object' && Object.keys(value).length === 0)) {
+    return '(none)';
+  }
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (_) {
+    return String(value);
+  }
+}
 
 function showTab(name) {
   const tabIds = ['state', 'context'];
@@ -654,12 +791,36 @@ function updateDrives(d) {
 }
 
 function updateContextTab(msg) {
-  const planText = (msg.htn_plan || []).join(' → ') || 'none';
+  const actionsText = (msg.selected_actions || []).join(' → ') || 'none';
   const topicText = (msg.topics || []).join(', ') || 'none';
   const factCount = (msg.temporal_facts || []).length;
+  const narrative = msg.narrative || {};
+  const execution = msg.execution || {};
+  const decision = msg.last_decision || {};
   document.getElementById('context-summary').textContent =
-    `Turn: ${msg.turn}\nStory: ${msg.story_stage}\nPlan: ${planText}\nTopics: ${topicText}\nTemporal facts: ${factCount}\nPrompt length: ${msg.prompt_length} chars\nFamiliarity: ${(msg.person_familiarity || 0).toFixed(2)}`;
+    `Turn: ${msg.turn}\nStage: ${narrative.stage || 'none'}\nBeat: ${narrative.beat_id || 'none'}\nNarrative decision: ${decision.narrative_decision || 'none'}\nExecution decision: ${decision.execution_decision || 'none'}\nTension: ${((narrative.tension || 0)).toFixed(2)}\nActions: ${actionsText}\nTopics: ${topicText}\nTemporal facts: ${factCount}\nPrompt length: ${msg.prompt_length} chars\nFamiliarity: ${(msg.person_familiarity || 0).toFixed(2)}`;
+  document.getElementById('unified-plan-view').textContent = pretty(msg.unified_plan);
   document.getElementById('prompt-view').textContent = msg.prompt || '(no prompt)';
+}
+
+function updatePlannerPanels(msg) {
+  const plan = msg.unified_plan || {};
+  const narrative = msg.narrative || {};
+  const execution = msg.execution || {};
+  const decision = msg.last_decision || {};
+  const memory = narrative.story_memory || [];
+  const plotStages = (narrative.a_plot || []).join(' → ') || 'none';
+  const actions = (execution.primitive_actions || []).join(' → ') || 'none';
+  document.getElementById('planner-info').textContent =
+    `Plan: ${plan.plan_id || 'none'}\nStatus: ${plan.status || 'unknown'}\nArchetype: ${narrative.archetype || 'none'}\nStage: ${narrative.stage || 'none'}\nBeat: ${narrative.beat_id || 'none'}\nGoal: ${narrative.beat_goal || 'none'}\nTension: ${((narrative.tension || 0)).toFixed(2)}\nA-plot: ${plotStages}`;
+  document.getElementById('narrative-summary').textContent =
+    narrative.summary || '(no narrative summary)';
+  document.getElementById('narrative-view').textContent = pretty(narrative);
+  document.getElementById('execution-view').textContent = pretty(execution);
+  document.getElementById('decision-view').textContent = pretty(decision);
+  document.getElementById('selected-actions').textContent = actions;
+  document.getElementById('story-memory').textContent =
+    (memory.length ? memory.map(item => `- ${item}`).join('\\n') : '(none)');
 }
 
 ws.onmessage = (e) => {
@@ -670,14 +831,15 @@ ws.onmessage = (e) => {
     document.getElementById('meta').textContent =
       `Session: ${sessionId} | Quads: ${msg.quads_in_kg} | Turn: 0`;
     if (msg.drives) updateDrives(msg.drives);
+    updatePlannerPanels(msg);
+    document.getElementById('unified-plan-view').textContent = pretty(msg.unified_plan);
   }
 
   if (msg.type === 'context_assembled') {
     updateDrives(msg.drives);
     document.getElementById('meta').textContent =
       `Session: ${sessionId} | Quads: ${msg.quads_in_kg} | Turn: ${msg.turn}`;
-    document.getElementById('story-info').textContent = msg.story_stage;
-    document.getElementById('htn-plan').textContent = msg.htn_plan.join(' → ');
+    updatePlannerPanels(msg);
     document.getElementById('topics').textContent = msg.topics.join(', ') || 'none';
     document.getElementById('tkg-facts').innerHTML =
       (msg.temporal_facts || []).map(f => `<div>${f}</div>`).join('');
@@ -685,9 +847,15 @@ ws.onmessage = (e) => {
 
     // Show context note
     addMsg(`[Context assembled: ${msg.prompt_length} chars, ` +
-           `plan: ${msg.htn_plan.join('→')}, ` +
+           `beat: ${(msg.narrative || {}).beat_id || 'none'}, ` +
+           `actions: ${(msg.selected_actions || []).join('→')}, ` +
            `familiarity: ${(msg.person_familiarity||0).toFixed(2)}]`,
            'sophia', 'SPARK Pipeline');
+  }
+
+  if (msg.type === 'planner_absorbed_drive') {
+    addMsg(`[Planner absorbed ${msg.layer}:${msg.trigger} into beat ${msg.beat_id || 'none'}]`,
+           'sophia', 'Planner');
   }
 
   if (msg.type === 'sophia_self_initiated') {

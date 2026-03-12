@@ -111,9 +111,9 @@ async def relationship_evolution(e1: str, rel: str, e2: str):
 async def create_plan(body: dict):
     return await proxy_post("htn", "/plan", body)
 
-@app.post("/api/v2/htn/plan/from-story")
-async def plan_from_story(body: dict):
-    return await proxy_post("htn", "/plan/from-story", body)
+@app.post("/api/v2/planner/step")
+async def planner_step(body: dict):
+    return await proxy_post("htn", "/plan/step", body)
 
 @app.post("/api/v2/htn/execute")
 async def execute_plan(body: dict):

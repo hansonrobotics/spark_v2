@@ -342,11 +342,12 @@ class TestDynamicHTNPlanner:
         assert "scan_environment" in [t.name for t in plan]
 
     @pytest.mark.asyncio
-    async def test_plan_from_story(self):
+    async def test_plan_step(self):
         state = WorldState(properties={"person_detected": True})
-        plan = await self.planner.plan_from_story(
-            "active_engagement", state,
-            {"story_category": "social", "person_known": False}
+        plan = await self.planner.plan_step(
+            "conduct_conversation",
+            state,
+            {"person_known": False, "person_detected": True}
         )
         assert plan is not None
 
@@ -576,12 +577,12 @@ class TestUnifiedRobotInterface:
 # INTEGRATION TESTS (require services running)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class TestIntegrationHTNStory:
-    """Tests HTN planner + Story Engine integration."""
+class TestIntegrationExecutionPlanning:
+    """Tests execution planning against narrative-shaped intents."""
 
     @pytest.mark.asyncio
-    async def test_story_generates_valid_htn_plan(self):
-        """Story stage should map to a valid HTN task that produces a plan."""
+    async def test_execution_intent_generates_valid_plan(self):
+        """Execution intent should map to a valid task that produces a plan."""
         registry = DynamicTaskRegistry()
         plnr = DynamicHTNPlanner(registry)
 
@@ -590,36 +591,36 @@ class TestIntegrationHTNStory:
             "person_known": False,
             "emergency": False,
         })
-        plan = await plnr.plan_from_story(
-            "active_engagement", state,
-            {"story_category": "social"}
+        plan = await plnr.plan_step(
+            "conduct_conversation",
+            state,
+            {"person_detected": True, "person_known": False}
         )
         assert plan is not None
         assert all(isinstance(t, PrimitiveTask) for t in plan)
 
     @pytest.mark.asyncio
-    async def test_all_story_stages_have_htn_mapping(self):
-        """Every story stage should produce some plan."""
+    async def test_common_execution_intents_have_plans(self):
+        """Common execution intents should produce plans."""
         registry = DynamicTaskRegistry()
         plnr = DynamicHTNPlanner(registry)
 
-        stages_and_states = [
-            ("idle_seeking", {"person_detected": False, "emergency": False}),
-            ("active_engagement", {"person_detected": True, "person_known": False}),
+        intents_and_states = [
+            ("scan_environment", {"person_detected": False, "emergency": False}),
+            ("conduct_conversation", {"person_detected": True, "person_known": False}),
         ]
-        for stage, props in stages_and_states:
+        for intent, props in intents_and_states:
             state = WorldState(properties=props)
-            plan = await plnr.plan_from_story(stage, state, {})
-            assert plan is not None, f"No plan for stage: {stage}"
+            plan = await plnr.plan_step(intent, state, props)
+            assert plan is not None, f"No plan for intent: {intent}"
 
     @pytest.mark.asyncio
-    async def test_unknown_story_stage_creates_task(self):
-        """An unknown story stage should dynamically create a task."""
+    async def test_unknown_execution_intent_creates_task(self):
+        """An unknown execution intent should dynamically create a task."""
         registry = DynamicTaskRegistry()
         plnr = DynamicHTNPlanner(registry)
         state = WorldState(properties={})
-        plan = await plnr.plan_from_story("never_seen_before", state, {})
-        # Should have created handle_never_seen_before
+        plan = await plnr.plan_step("never_seen_before", state, {})
         assert registry.get_task("handle_never_seen_before") is not None
         assert registry.get_task("handle_never_seen_before").created_by == "sophia"
 
