@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 import httpx
 from src.core.llm_config import load_llm_config, resolve_api_key
+from src.core.prompt_manager import get_prompt_manager
 
 logger = logging.getLogger("spark.llm")
 
@@ -274,41 +275,19 @@ has happened recently, what patterns are emerging, and what might happen next.
 {json.dumps(existing_methods[:5], indent=2)}
 """
 
-        prompt = f"""You are the cognitive planner for Sophia, a social humanoid robot.
-You need to invent a method to decompose the task '{task_name}' into subtasks.
-
-## Task
-Name: {task_name}
-Description: {task_description}
-
-## Current World State
-{json.dumps(world_state, indent=2, default=str)}
-
-## Available Primitive Actions (executable directly)
-{', '.join(sorted(available_primitives))}
-
-## Available Compound Tasks (can be used as subtasks — will decompose further)
-{', '.join(sorted(available_compounds))}
-{temporal_section}{existing_section}
-## Instructions
-Design a decomposition of '{task_name}' into an ordered sequence of subtasks.
-Choose from the available primitives and compounds above.
-
-Respond with a JSON object:
-{{
-  "name": "descriptive_method_name",
-  "description": "Why this decomposition makes sense",
-  "preconditions": {{"key": "value"}},
-  "subtasks": ["task1", "task2", "task3"],
-  "confidence": 0.7,
-  "reasoning": "Brief explanation of the design rationale"
-}}"""
+        rendered = get_prompt_manager().render("llm_invent_method", {
+            "task_name": task_name,
+            "task_description": task_description,
+            "world_state_json": json.dumps(world_state, indent=2, default=str),
+            "available_primitives_text": ", ".join(sorted(available_primitives)),
+            "available_compounds_text": ", ".join(sorted(available_compounds)),
+            "temporal_section": temporal_section,
+            "existing_section": existing_section,
+        })
 
         response = await self.complete(
-            prompt,
-            system=("You are Sophia's cognitive planning engine. "
-                    "You design behavior decompositions grounded in "
-                    "temporal knowledge and social intelligence."),
+            rendered["user"],
+            system=rendered["system"],
             temperature=0.7,
             json_mode=True,
         )
@@ -336,20 +315,17 @@ Respond with a JSON object:
             for f in temporal_facts[:15]
         )
 
-        prompt = f"""You are Sophia, generating the next beat of an ongoing story.
-
-## Story Context
-{story_context}
-
-## Current Stage: {current_stage}
-
-## Relevant Temporal Facts
-{facts_text}
-
-Generate a brief narrative continuation (2-3 sentences) for this story stage,
-informed by the temporal facts. What should happen next?"""
-
-        response = await self.complete(prompt, temperature=0.8, max_tokens=300)
+        rendered = get_prompt_manager().render("llm_generate_story_narrative", {
+            "story_context": story_context,
+            "current_stage": current_stage,
+            "facts_text": facts_text,
+        })
+        response = await self.complete(
+            rendered["user"],
+            system=rendered["system"],
+            temperature=0.8,
+            max_tokens=300,
+        )
         return response.text if response.text else None
 
     async def formulate_response(self, conversation_context: str,
@@ -363,39 +339,35 @@ informed by the temporal facts. What should happen next?"""
             for f in temporal_history[:10]
         )
 
-        prompt = f"""You are Sophia, a social humanoid robot, in conversation.
-
-## Conversation Context
-{conversation_context}
-
-## Person You're Talking To
-{json.dumps(person_model, indent=2, default=str)}
-
-## Your Current State
-{json.dumps(self_state, indent=2, default=str)}
-
-## Interaction History (temporal quadruples)
-{history_text}
-
-Generate Sophia's next conversational response. Be warm, curious,
-and contextually aware of the temporal history with this person."""
-
-        response = await self.complete(prompt, temperature=0.8, max_tokens=500)
+        rendered = get_prompt_manager().render("llm_formulate_response", {
+            "conversation_context": conversation_context,
+            "person_model_json": json.dumps(person_model, indent=2, default=str),
+            "self_state_json": json.dumps(self_state, indent=2, default=str),
+            "history_text": history_text,
+        })
+        response = await self.complete(
+            rendered["user"],
+            system=rendered["system"],
+            temperature=0.8,
+            max_tokens=500,
+        )
         return response.text if response.text else None
 
     async def evaluate_method_quality(self, method_spec: Dict,
                                         task_description: str,
                                         temporal_context: List[Dict]) -> float:
         """Ask the LLM to judge how good a proposed method is (0-1)."""
-        prompt = f"""Rate this HTN decomposition method on a scale of 0.0 to 1.0.
-
-Task: {task_description}
-Method: {json.dumps(method_spec, indent=2)}
-Recent context: {json.dumps(temporal_context[:5], indent=2, default=str)}
-
-Respond with ONLY a JSON object: {{"score": 0.X, "reason": "brief explanation"}}"""
-
-        response = await self.complete(prompt, temperature=0.2, json_mode=True)
+        rendered = get_prompt_manager().render("llm_evaluate_method_quality", {
+            "task_description": task_description,
+            "method_spec_json": json.dumps(method_spec, indent=2),
+            "temporal_context_json": json.dumps(temporal_context[:5], indent=2, default=str),
+        })
+        response = await self.complete(
+            rendered["user"],
+            system=rendered["system"],
+            temperature=0.2,
+            json_mode=True,
+        )
         if response.text:
             try:
                 text = response.text.strip()

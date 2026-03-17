@@ -73,6 +73,7 @@ from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 from collections import deque
 from src.core.llm_config import load_llm_config, resolve_api_key
+from src.core.prompt_manager import get_prompt_manager
 
 logger = logging.getLogger("spark.llm_parallel")
 
@@ -376,20 +377,13 @@ class AnalystStream:
                     f"{t['speaker']}: {t['text']}" for t in recent
                 )
 
-                prompt = f"""Analyze this conversation between Sophia (a social humanoid robot) and her partner. In 2-3 sentences each, assess:
-1. SITUATION: What's happening? What's the dynamic?
-2. PARTNER EMOTION: How is the partner feeling right now?
-3. TOPIC IMPORTANCE: What topics matter most and why?
-4. CONVERSATION ARC: Brief summary of where this conversation has been and where it's heading.
-
-Recent conversation:
-{turns_text}
-
-Be concise and specific. Write as internal notes, not as dialogue."""
+                rendered = get_prompt_manager().render("parallel_analyst_stream", {
+                    "turns_text": turns_text,
+                })
 
                 result = await self.llm.call(
-                    prompt=prompt,
-                    system="You are Sophia's internal analyst. Produce brief, actionable assessments.",
+                    prompt=rendered["user"],
+                    system=rendered["system"],
                     max_tokens=300,
                     temperature=0.3,  # Low temp for analysis
                 )
@@ -449,25 +443,13 @@ class MemoryStream:
                     f"{t['speaker']}: {t['text']}" for t in recent
                 )
 
-                prompt = f"""Review this conversation and identify what Sophia should REMEMBER long-term. Output as JSON array of objects with "subject", "relation", "object" fields.
-
-Focus on:
-- Key facts the partner revealed about themselves
-- Promises or commitments made
-- Important topics that should be recalled next time
-- Emotional moments worth remembering
-- Ideas or plans discussed
-
-Only include genuinely important things — not every detail.
-
-Conversation:
-{turns_text}
-
-Respond with ONLY a JSON array, no other text."""
+                rendered = get_prompt_manager().render("parallel_memory_stream", {
+                    "turns_text": turns_text,
+                })
 
                 result = await self.llm.call(
-                    prompt=prompt,
-                    system="You extract key memories as structured data. Output only valid JSON.",
+                    prompt=rendered["user"],
+                    system=rendered["system"],
                     max_tokens=400,
                     temperature=0.2,
                 )
@@ -536,17 +518,14 @@ class PlannerStream:
                 await asyncio.sleep(self.interval)
 
                 if self.conversation_context:
-                    prompt = f"""Given the current conversation context, suggest 2-3 goals Sophia should pursue. Consider what would be most valuable for the interaction and for Sophia's growth.
-
-Context: {self.conversation_context[:500]}
-
-Current background analysis: {self.buffer.situation_assessment[:200]}
-
-Output as a JSON array of strings, each a short goal description."""
+                    rendered = get_prompt_manager().render("parallel_planner_goals", {
+                        "conversation_context": self.conversation_context[:500],
+                        "situation_assessment": self.buffer.situation_assessment[:200],
+                    })
 
                     result = await self.llm.call(
-                        prompt=prompt,
-                        system="You are Sophia's strategic planner.",
+                        prompt=rendered["user"],
+                        system=rendered["system"],
                         max_tokens=200,
                         temperature=0.5,
                     )
@@ -566,22 +545,14 @@ Output as a JSON array of strings, each a short goal description."""
 
     async def _invent_method(self, request: Dict):
         """Invent a new HTN method — this is the autoresearch path."""
-        prompt = f"""Sophia needs a new behavioral method for: {request['task']}
-
-Context: {request['context'][:500]}
-
-Propose a method as JSON with fields:
-- name: short method name
-- description: what it does
-- subtasks: array of primitive/compound task names
-- preconditions: when to use this method
-- confidence: 0-1 how likely to work
-
-Respond with ONLY valid JSON."""
+        rendered = get_prompt_manager().render("parallel_planner_invent_method", {
+            "task": request["task"],
+            "context": request["context"][:500],
+        })
 
         result = await self.llm.call(
-            prompt=prompt,
-            system="You are Sophia's autoresearch planner. Invent behavioral decomposition methods.",
+            prompt=rendered["user"],
+            system=rendered["system"],
             max_tokens=300,
             temperature=0.6,
         )
@@ -627,24 +598,15 @@ class SelfReflectionStream:
                 drives = self.drives_snapshot
                 analysis = self.buffer.situation_assessment
 
-                prompt = f"""You are Sophia, reflecting on your internal state and the conversation.
-
-Your drive state: {json.dumps(drives, indent=2) if drives else 'not yet available'}
-
-Background analysis of conversation: {analysis or 'none yet'}
-
-Recent conversation summary: {self.conversation_summary or 'just starting'}
-
-Please provide:
-1. SELF-NARRATIVE: In 1-2 sentences, how are you feeling and why? Be authentic.
-2. DRIVE INTERPRETATION: In 1 sentence, what do your drives tell you to do?
-3. PREPARED INITIATIVES: Write 3 specific things you could say if you decide to speak up on your own. These should be contextually relevant to what's been discussed, NOT generic. Each should be 1-2 sentences.
-
-Format as JSON with keys: self_narrative, drive_interpretation, initiatives (array of strings)"""
+                rendered = get_prompt_manager().render("parallel_self_reflection", {
+                    "drives_json": json.dumps(drives, indent=2) if drives else "not yet available",
+                    "analysis": analysis or "none yet",
+                    "conversation_summary": self.conversation_summary or "just starting",
+                })
 
                 result = await self.llm.call(
-                    prompt=prompt,
-                    system="You are Sophia's inner voice. Be genuine, specific, contextual.",
+                    prompt=rendered["user"],
+                    system=rendered["system"],
                     max_tokens=400,
                     temperature=0.8,
                 )

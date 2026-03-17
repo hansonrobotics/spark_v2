@@ -1,5 +1,20 @@
 """
 SPARK v2 — Live Server with Drive System
+Copyright (C) 2026 Hanson Robotics Limited
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 Runs as a real FastAPI application on Ubuntu with:
   - Persistent SQLite temporal KG
   - Physio-emotional drive system with autonomous initiative
@@ -19,12 +34,14 @@ from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, _PROJECT_ROOT)
-from src.runtime.sophia_live import TemporalKGLite, format_sophia_prompt
+from src.runtime.sophia_live import TemporalKGLite, render_sophia_prompt
 from src.core.hierarchical_drives import (
     HierarchicalDriveSystem, DriveLayer, DriveSignal
 )
@@ -36,6 +53,10 @@ from src.weave.runtime import (
     PlannerDecision,
     UnifiedPlan,
     UnifiedPlanner,
+)
+from src.core.prompt_manager import (
+    PromptValidationError,
+    get_prompt_manager,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
@@ -433,6 +454,14 @@ mind: Optional[SophiaMindLive] = None
 active_websockets: List[WebSocket] = []
 drive_task: Optional[asyncio.Task] = None
 llm_client: Optional[SparkLLMClient] = None
+prompt_manager = get_prompt_manager()
+
+
+class PromptUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    system_template: Optional[str] = None
+    user_template: Optional[str] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -533,7 +562,8 @@ async def websocket_chat(ws: WebSocket):
             if msg.get("type") == "user_message":
                 text = msg["text"]
                 ctx = await mind.process_message(text, llm_client=llm_client)
-                prompt = format_sophia_prompt(ctx)
+                prompt_payload = render_sophia_prompt(ctx)
+                prompt = prompt_payload["user"]
 
                 await ws.send_text(json.dumps({
                     "type": "context_assembled",
@@ -554,6 +584,7 @@ async def websocket_chat(ws: WebSocket):
 
                 response = await llm_client.complete(
                     prompt,
+                    system=prompt_payload["system"],
                     temperature=0.8,
                     max_tokens=400,
                 )
@@ -624,6 +655,48 @@ async def kg_count():
     return {"count": mind.kg.count_quads() if mind else 0}
 
 
+@app.get("/api/prompts")
+async def prompts_list():
+    return {
+        "path": prompt_manager.path,
+        "prompts": list(prompt_manager.list_prompts().values()),
+    }
+
+
+@app.put("/api/prompts/{prompt_id}")
+async def prompts_update(prompt_id: str, payload: PromptUpdateRequest):
+    update_data = (
+        payload.model_dump(exclude_none=True)
+        if hasattr(payload, "model_dump")
+        else payload.dict(exclude_none=True)
+    )
+    try:
+        updated = prompt_manager.update_prompt(
+            prompt_id,
+            **update_data,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PromptValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "path": prompt_manager.path,
+        "prompt": updated,
+    }
+
+
+@app.post("/api/prompts/reload")
+async def prompts_reload():
+    try:
+        prompt_manager.reload()
+    except PromptValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "path": prompt_manager.path,
+        "prompts": list(prompt_manager.list_prompts().values()),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # EMBEDDED CHAT UI
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -664,6 +737,13 @@ h3 { color: #7aa2f7; margin: 12px 0 8px; font-size: 13px; text-transform: upperc
 .json-box { background: #0d0f16; border: 1px solid #262b38; border-radius: 8px; padding: 10px; font-size: 11px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; color: #d8deef; max-height: 28vh; overflow-y: auto; margin-bottom: 10px; }
 .story-summary { font-size: 12px; color: #c3cbe0; line-height: 1.45; background: #161925; border: 1px solid #262b38; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
 .memory-list { font-size: 11px; color: #aab2c8; line-height: 1.5; white-space: pre-wrap; }
+.prompt-select, .prompt-input, .prompt-textarea { width: 100%; background: #0d0f16; color: #d8deef; border: 1px solid #262b38; border-radius: 8px; padding: 10px; font-size: 12px; margin-bottom: 10px; }
+.prompt-textarea { min-height: 180px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.45; }
+.prompt-actions { display: flex; gap: 8px; margin-bottom: 10px; }
+.prompt-actions button { flex: 1; background: #2563eb; color: #fff; border: none; border-radius: 8px; padding: 10px; cursor: pointer; font-size: 12px; }
+.prompt-actions button.secondary { background: #1f2937; }
+.prompt-status { font-size: 11px; color: #8b93a7; white-space: pre-wrap; margin-bottom: 10px; }
+.prompt-path { font-size: 11px; color: #8b93a7; word-break: break-all; margin-bottom: 10px; }
 </style></head>
 <body>
 <div id="sidebar">
@@ -673,6 +753,7 @@ h3 { color: #7aa2f7; margin: 12px 0 8px; font-size: 13px; text-transform: upperc
   <div class="tab-row">
     <button id="tab-state" class="tab-btn active" onclick="showTab('state')">State</button>
     <button id="tab-context" class="tab-btn" onclick="showTab('context')">Context</button>
+    <button id="tab-prompts" class="tab-btn" onclick="showTab('prompts')">Prompts</button>
   </div>
   <div id="panel-state" class="tab-panel active">
     <h3>Drives</h3>
@@ -703,6 +784,23 @@ h3 { color: #7aa2f7; margin: 12px 0 8px; font-size: 13px; text-transform: upperc
     <h3>Model Input</h3>
     <div id="prompt-view" class="prompt-box">Waiting for the first prompt...</div>
   </div>
+  <div id="panel-prompts" class="tab-panel">
+    <h3>Prompt File</h3>
+    <div id="prompt-path" class="prompt-path">Loading...</div>
+    <h3>Prompt</h3>
+    <select id="prompt-selector" class="prompt-select" onchange="selectPrompt(this.value)"></select>
+    <input id="prompt-title" class="prompt-input" placeholder="Prompt title" />
+    <input id="prompt-description" class="prompt-input" placeholder="Prompt description" />
+    <h3>System Template</h3>
+    <textarea id="prompt-system" class="prompt-textarea" spellcheck="false"></textarea>
+    <h3>User Template</h3>
+    <textarea id="prompt-user" class="prompt-textarea" spellcheck="false"></textarea>
+    <div class="prompt-actions">
+      <button onclick="savePrompt()">Save Prompt</button>
+      <button class="secondary" onclick="reloadPrompts()">Reload File</button>
+    </div>
+    <div id="prompt-status" class="prompt-status">Prompt editor ready.</div>
+  </div>
 </div>
 <div id="main">
   <div id="chat"></div>
@@ -716,6 +814,8 @@ const ws = new WebSocket(`ws://${location.host}/ws/chat`);
 const chat = document.getElementById('chat');
 const msgInput = document.getElementById('msg');
 let sessionId = '...';
+let promptCatalog = [];
+let currentPromptId = '';
 
 function pretty(value) {
   if (!value || (typeof value === 'object' && Object.keys(value).length === 0)) {
@@ -730,7 +830,7 @@ function pretty(value) {
 }
 
 function showTab(name) {
-  const tabIds = ['state', 'context'];
+  const tabIds = ['state', 'context', 'prompts'];
   tabIds.forEach(id => {
     document.getElementById(`tab-${id}`).classList.toggle('active', id === name);
     document.getElementById(`panel-${id}`).classList.toggle('active', id === name);
@@ -823,6 +923,90 @@ function updatePlannerPanels(msg) {
     (memory.length ? memory.map(item => `- ${item}`).join('\\n') : '(none)');
 }
 
+function setPromptStatus(text, isError=false) {
+  const el = document.getElementById('prompt-status');
+  el.textContent = text;
+  el.style.color = isError ? '#fca5a5' : '#8b93a7';
+}
+
+function renderPromptEditor(promptId) {
+  const prompt = promptCatalog.find(item => item.prompt_id === promptId);
+  if (!prompt) return;
+  currentPromptId = prompt.prompt_id;
+  document.getElementById('prompt-selector').value = prompt.prompt_id;
+  document.getElementById('prompt-title').value = prompt.title || '';
+  document.getElementById('prompt-description').value = prompt.description || '';
+  document.getElementById('prompt-system').value = prompt.system_template || '';
+  document.getElementById('prompt-user').value = prompt.user_template || '';
+  setPromptStatus(`Editing ${prompt.prompt_id}`);
+}
+
+function selectPrompt(promptId) {
+  renderPromptEditor(promptId);
+}
+
+async function loadPrompts(selectedId='') {
+  try {
+    const res = await fetch('/api/prompts');
+    const data = await res.json();
+    promptCatalog = data.prompts || [];
+    document.getElementById('prompt-path').textContent = data.path || '(unknown path)';
+    const selector = document.getElementById('prompt-selector');
+    selector.innerHTML = promptCatalog.map(item =>
+      `<option value="${item.prompt_id}">${item.prompt_id}</option>`
+    ).join('');
+    if (!promptCatalog.length) {
+      setPromptStatus('No prompts found.', true);
+      return;
+    }
+    renderPromptEditor(selectedId || currentPromptId || promptCatalog[0].prompt_id);
+  } catch (err) {
+    setPromptStatus(`Failed to load prompts: ${err}`, true);
+  }
+}
+
+async function savePrompt() {
+  if (!currentPromptId) {
+    setPromptStatus('No prompt selected.', true);
+    return;
+  }
+  const payload = {
+    title: document.getElementById('prompt-title').value,
+    description: document.getElementById('prompt-description').value,
+    system_template: document.getElementById('prompt-system').value,
+    user_template: document.getElementById('prompt-user').value,
+  };
+  try {
+    const res = await fetch(`/api/prompts/${currentPromptId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.detail || 'prompt update failed');
+    }
+    await loadPrompts(currentPromptId);
+    setPromptStatus(`Saved ${currentPromptId} to ${data.path}`);
+  } catch (err) {
+    setPromptStatus(`Failed to save prompt: ${err}`, true);
+  }
+}
+
+async function reloadPrompts() {
+  try {
+    const res = await fetch('/api/prompts/reload', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.detail || 'prompt reload failed');
+    }
+    await loadPrompts(currentPromptId);
+    setPromptStatus(`Reloaded prompts from ${data.path}`);
+  } catch (err) {
+    setPromptStatus(`Failed to reload prompts: ${err}`, true);
+  }
+}
+
 ws.onmessage = (e) => {
   const msg = JSON.parse(e.data);
 
@@ -887,6 +1071,7 @@ function send() {
   msgInput.value = '';
 }
 msgInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+loadPrompts();
 </script>
 </body></html>"""
 

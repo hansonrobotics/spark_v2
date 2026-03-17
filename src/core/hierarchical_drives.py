@@ -52,6 +52,8 @@ from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
+from src.core.prompt_manager import get_prompt_manager
+
 logger = logging.getLogger("spark.drives")
 
 
@@ -367,15 +369,11 @@ class InitiativeLayer:
         if llm_client is None:
             return self._fallback_message(trigger, snapshot)
 
-        prompt = self._build_prompt(trigger, intensity, snapshot)
+        rendered = self._build_prompt(trigger, intensity, snapshot)
         try:
             response = await llm_client.complete(
-                prompt,
-                system=(
-                    "You are Sophia's initiative stream. Generate exactly one "
-                    "short self-initiated utterance grounded in the provided "
-                    "conversation context. Return only the message Sophia would say."
-                ),
+                rendered["user"],
+                system=rendered["system"],
                 temperature=0.9,
                 max_tokens=90,
             )
@@ -417,25 +415,12 @@ class InitiativeLayer:
         return snapshot
 
     def _build_prompt(self, trigger: str, intensity: float,
-                      snapshot: Dict[str, Any]) -> str:
-        return f"""Generate Sophia's next self-initiated message.
-
-Trigger type: {trigger}
-Trigger intensity: {intensity:.2f}
-
-Current context:
-{json.dumps(snapshot, indent=2, default=str)}
-
-Instructions:
-- Write exactly one concise message Sophia would say right now.
-- Use the trigger type and context to decide the content.
-- Make it sound spontaneous and grounded in the active conversation.
-- Keep it to 1-2 sentences and under 35 words.
-- No labels, no quotes, no markdown, no stage directions.
-- If the trigger is `goal_directed_boredom`, naturally steer toward the provided goal.
-- If the trigger is `curiosity_burst`, surface a fresh connection, question, or hypothesis.
-- If the trigger is `impatience`, let urgency show without sounding hostile.
-- If the trigger is `boredom`, reopen or propose a topic that fits the recent chat."""
+                      snapshot: Dict[str, Any]) -> Dict[str, str]:
+        return get_prompt_manager().render("initiative_generation", {
+            "trigger": trigger,
+            "intensity": f"{float(intensity):.2f}",
+            "snapshot_json": json.dumps(snapshot, indent=2, default=str),
+        })
 
     @staticmethod
     def _sanitize_generated_message(text: str) -> str:

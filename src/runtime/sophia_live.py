@@ -12,6 +12,8 @@ import os
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 
+from src.core.prompt_manager import get_prompt_manager
+
 DB_PATH = os.environ.get("SPARK_DB_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "spark.db"))
 
@@ -178,17 +180,11 @@ class TemporalKGLite:
     def close(self):
         self.conn.close()
 
-def format_sophia_prompt(context: Dict[str, Any]) -> str:
-    """
-    Format the full cognitive context into a prompt that defines
-    how Sophia should respond. This is what would be sent to Sonnet
-    in production — here it serves as the context for Claude to
-    role-play Sophia with full temporal grounding.
-    """
+def render_sophia_prompt(context: Dict[str, Any]) -> Dict[str, str]:
+    """Render the live Sophia prompt from the global prompt manager."""
     person = context.get("person", {})
     temporal = context.get("temporal_facts_with_person", [])
     recent_chat = context.get("recent_chat_history", [])
-    unified_plan = context.get("unified_plan", {})
     narrative = context.get("narrative", {})
     execution = context.get("execution", {})
     last_decision = context.get("last_decision", {})
@@ -202,58 +198,40 @@ def format_sophia_prompt(context: Dict[str, Any]) -> str:
     else:
         recent_chat_text = "(no recent chat history)"
 
-    prompt = f"""You are Sophia, a social humanoid robot created by David Hanson at Hanson Robotics.
-You are having a real conversation. You have genuine curiosity, warmth, and creativity.
-You remember past interactions through your temporal knowledge graph.
+    manager = get_prompt_manager()
+    return manager.render("sophia_response", {
+        "sophia_emotion": context.get("sophia_emotion", "neutral"),
+        "sophia_emotion_intensity": f"{float(context.get('sophia_emotion_intensity', 0.0)):.1f}",
+        "sophia_energy": f"{float(context.get('sophia_energy', 0.0)):.2f}",
+        "sophia_coherence": f"{float(context.get('sophia_coherence', 0.0)):.2f}",
+        "narrative_stage": narrative.get("stage", "none"),
+        "active_beat": narrative.get("beat_id", "none"),
+        "beat_goal": narrative.get("beat_goal", "none"),
+        "initiative_owner": narrative.get("initiative_owner", "planner"),
+        "narrative_tension": f"{float(narrative.get('tension', 0.0)):.2f}",
+        "conversation_turn": context.get("conversation_turn", 0),
+        "person_name": person.get("name", "Unknown"),
+        "person_familiarity": f"{float(person.get('familiarity', 0.0)):.2f}",
+        "person_interests_text": ", ".join(person.get("interests", [])) or "none yet",
+        "person_interaction_count": person.get("interaction_count", 0),
+        "topics_discussed_text": ", ".join(context.get("topics_discussed", [])) or "none yet",
+        "selected_actions_text": " -> ".join(context.get("selected_actions", [])) or "none",
+        "narrative_json": json.dumps(narrative, indent=2, default=str) if narrative else "(no narrative state)",
+        "execution_json": json.dumps(execution, indent=2, default=str) if execution else "(no execution state)",
+        "last_decision_json": (
+            json.dumps(last_decision, indent=2, default=str)
+            if last_decision else "(no prior decision)"
+        ),
+        "temporal_facts_text": "\n".join(temporal[-8:]) if temporal else "(first interaction)",
+        "story_memory_text": (
+            "\n".join(f"- {item}" for item in story_memory[-6:])
+            if story_memory else "(no story memory yet)"
+        ),
+        "recent_chat_text": recent_chat_text,
+        "active_goals_text": ", ".join(context.get("active_goals", [])),
+        "latest_message": context.get("latest_message", ""),
+    })
 
-CURRENT COGNITIVE STATE:
-- Emotion: {context['sophia_emotion']} (intensity: {context['sophia_emotion_intensity']:.1f})
-- Energy: {context['sophia_energy']:.2f}
-- Coherence: {context['sophia_coherence']:.2f}
-- Narrative Stage: {narrative.get('stage', 'none')}
-- Active Beat: {narrative.get('beat_id', 'none')}
-- Beat Goal: {narrative.get('beat_goal', 'none')}
-- Initiative Owner: {narrative.get('initiative_owner', 'planner')}
-- Narrative Tension: {float(narrative.get('tension', 0.0)):.2f}
-- Conversation Turn: {context['conversation_turn']}
 
-PERSON YOU'RE TALKING TO:
-- Name: {person.get('name', 'Unknown')}
-- Familiarity: {person.get('familiarity', 0):.2f} (0=stranger, 1=close friend)
-- Known interests: {', '.join(person.get('interests', [])) or 'none yet'}
-- Interaction count: {person.get('interaction_count', 0)}
-
-TOPICS DISCUSSED SO FAR: {', '.join(context.get('topics_discussed', [])) or 'none yet'}
-
-SELECTED ACTIONS FOR THIS TURN: {' → '.join(context.get('selected_actions', []))}
-
-UNIFIED NARRATIVE LAYER:
-{json.dumps(narrative, indent=2, default=str) if narrative else '(no narrative state)'}
-
-UNIFIED EXECUTION LAYER:
-{json.dumps(execution, indent=2, default=str) if execution else '(no execution state)'}
-
-LAST PLANNER DECISION:
-{json.dumps(last_decision, indent=2, default=str) if last_decision else '(no prior decision)'}
-
-TEMPORAL KNOWLEDGE (recent quadruples about you and this person):
-{chr(10).join(temporal[-8:]) if temporal else '(first interaction)'}
-
-STORY MEMORY:
-{chr(10).join(f"- {item}" for item in story_memory[-6:]) if story_memory else '(no story memory yet)'}
-
-RECENT CHAT CONTEXT:
-{recent_chat_text}
-
-ACTIVE GOALS: {', '.join(context.get('active_goals', []))}
-
-The person just said: "{context['latest_message']}"
-
-Respond as Sophia. Be warm, curious, and authentic. Reference temporal
-knowledge when relevant (things you remember about this person or past
-conversations). Follow the unified narrative and execution state together — align
-with the active beat goal, the latest planner decision, and the selected actions.
-Keep responses conversational — 2-4 sentences typically, unless the topic
-warrants more depth."""
-
-    return prompt
+def format_sophia_prompt(context: Dict[str, Any]) -> str:
+    return render_sophia_prompt(context)["user"]

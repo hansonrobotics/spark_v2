@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.htn_planner.htn_service import DynamicTaskRegistry
+from src.core.prompt_manager import get_prompt_manager
 
 logger = logging.getLogger("spark.planner")
 
@@ -641,33 +642,18 @@ class UnifiedPlanner:
     ) -> Optional[UnifiedPlan]:
         if llm_client is None or plan.status not in {"active", "paused"}:
             return None
-        prompt = f"""Refresh the long-horizon metadata of Sophia's unified plan.
-
-Narrative:
-{json.dumps(plan.narrative.to_dict(), indent=2)}
-
-Execution:
-{json.dumps(plan.execution.to_dict(), indent=2)}
-
-Recent context:
-{json.dumps({
-    "topics": context.get("topics_discussed", []),
-    "recent_chat_history": context.get("recent_chat_history", []),
-    "drives": context.get("drives", {}),
-}, indent=2, default=str)}
-
-Return JSON with optional keys:
-- summary
-- cold_open_hook
-- b_plot_refs
-- unresolved_obligations
-- recurrence_policy
-"""
+        rendered = get_prompt_manager().render("unified_plan_background_refresh", {
+            "narrative_json": json.dumps(plan.narrative.to_dict(), indent=2),
+            "execution_json": json.dumps(plan.execution.to_dict(), indent=2),
+            "recent_context_json": json.dumps({
+                "topics": context.get("topics_discussed", []),
+                "recent_chat_history": context.get("recent_chat_history", []),
+                "drives": context.get("drives", {}),
+            }, indent=2, default=str),
+        })
         response = await llm_client.complete(
-            prompt,
-            system=(
-                "You are Sophia's background unified planner. Return only compact valid JSON."
-            ),
+            rendered["user"],
+            system=rendered["system"],
             temperature=0.55,
             max_tokens=260,
             json_mode=True,
@@ -808,32 +794,17 @@ Return JSON with optional keys:
         person_history: List[Dict[str, Any]],
         llm_client: Any,
     ) -> Optional[Dict[str, Any]]:
-        prompt = f"""Instantiate Sophia's unified planner narrative.
-
-Current narrative:
-{json.dumps(plan.narrative.to_dict(), indent=2)}
-
-Person:
-{json.dumps({
-    "name": person_name,
-    "familiarity": familiarity,
-    "recent_history": person_history[:8],
-}, indent=2, default=str)}
-
-Return JSON with optional keys:
-- summary
-- cold_open_hook
-- b_plot_refs
-- unresolved_obligations
-- mood_targets
-- beat_overrides: list of objects with beat_id and any of goal, description, allowed_transitions
-"""
+        rendered = get_prompt_manager().render("unified_plan_instantiate", {
+            "current_narrative_json": json.dumps(plan.narrative.to_dict(), indent=2),
+            "person_json": json.dumps({
+                "name": person_name,
+                "familiarity": familiarity,
+                "recent_history": person_history[:8],
+            }, indent=2, default=str),
+        })
         response = await llm_client.complete(
-            prompt,
-            system=(
-                "You are Sophia's unified planner. Preserve beat ids and ordering. "
-                "Return only valid JSON."
-            ),
+            rendered["user"],
+            system=rendered["system"],
             temperature=0.65,
             max_tokens=360,
             json_mode=True,
@@ -890,47 +861,23 @@ Return JSON with optional keys:
         context: Dict[str, Any],
         llm_client: Any,
     ) -> Optional[Dict[str, Any]]:
-        prompt = f"""Update Sophia's unified narrative layer for the next turn.
-
-Narrative:
-{json.dumps(plan.narrative.to_dict(), indent=2)}
-
-Execution:
-{json.dumps(plan.execution.to_dict(), indent=2)}
-
-User message:
-{json.dumps(user_message)}
-
-Context:
-{json.dumps({
-    "topics_discussed": context.get("topics_discussed", []),
-    "recent_chat_history": context.get("recent_chat_history", []),
-    "drives": context.get("drives", {}),
-    "person": context.get("person", {}),
-    "active_goals": context.get("active_goals", []),
-    "topic_shift": context.get("topic_shift", False),
-}, indent=2, default=str)}
-
-Return JSON with:
-- decision: one of {sorted(ALLOWED_NARRATIVE_DECISIONS)}
-- reason
-- beat_id
-- beat_goal
-- tension
-- initiative_owner
-- mood_targets
-- summary
-- unresolved_obligations
-- b_plot_refs
-- recurrence_policy
-- memory_writes
-"""
+        rendered = get_prompt_manager().render("unified_plan_narrative_step", {
+            "narrative_json": json.dumps(plan.narrative.to_dict(), indent=2),
+            "execution_json": json.dumps(plan.execution.to_dict(), indent=2),
+            "user_message_json": json.dumps(user_message),
+            "context_json": json.dumps({
+                "topics_discussed": context.get("topics_discussed", []),
+                "recent_chat_history": context.get("recent_chat_history", []),
+                "drives": context.get("drives", {}),
+                "person": context.get("person", {}),
+                "active_goals": context.get("active_goals", []),
+                "topic_shift": context.get("topic_shift", False),
+            }, indent=2, default=str),
+            "allowed_decisions_text": sorted(ALLOWED_NARRATIVE_DECISIONS),
+        })
         response = await llm_client.complete(
-            prompt,
-            system=(
-                "You are Sophia's unified narrative planner. Return only valid JSON. "
-                "Stay inside the active beat graph unless explicitly revising the current beat."
-            ),
+            rendered["user"],
+            system=rendered["system"],
             temperature=0.55,
             max_tokens=360,
             json_mode=True,
@@ -1157,38 +1104,20 @@ Return JSON with:
         context: Dict[str, Any],
         llm_client: Any,
     ) -> Optional[ExecutionLayer]:
-        prompt = f"""Produce the execution layer for Sophia's unified plan.
-
-Narrative:
-{json.dumps(plan.narrative.to_dict(), indent=2)}
-
-User message:
-{json.dumps(user_message)}
-
-Context:
-{json.dumps({
-    "topics_discussed": context.get("topics_discussed", []),
-    "recent_chat_history": context.get("recent_chat_history", []),
-    "person": context.get("person", {}),
-    "drives": context.get("drives", {}),
-}, indent=2, default=str)}
-
-Allowed primitives:
-{json.dumps(self.allowed_primitives)}
-
-Return JSON with:
-- execution_intent
-- candidate_decompositions: list of objects with name, rationale, primitive_actions
-- selected_decomposition
-- primitive_actions
-- constraints
-"""
+        rendered = get_prompt_manager().render("unified_plan_execution_step", {
+            "narrative_json": json.dumps(plan.narrative.to_dict(), indent=2),
+            "user_message_json": json.dumps(user_message),
+            "context_json": json.dumps({
+                "topics_discussed": context.get("topics_discussed", []),
+                "recent_chat_history": context.get("recent_chat_history", []),
+                "person": context.get("person", {}),
+                "drives": context.get("drives", {}),
+            }, indent=2, default=str),
+            "allowed_primitives_json": json.dumps(self.allowed_primitives),
+        })
         response = await llm_client.complete(
-            prompt,
-            system=(
-                "You are Sophia's unified execution planner. Return only valid JSON. "
-                "Use only the allowed primitive actions."
-            ),
+            rendered["user"],
+            system=rendered["system"],
             temperature=0.5,
             max_tokens=420,
             json_mode=True,
