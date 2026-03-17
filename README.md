@@ -496,4 +496,4 @@ Both build on: Hanson et al. (2025) "Sentience Quest" — arXiv:2505.12229
 
 ## License
 
-Proprietary — Hanson Robotics Limited. All rights reserved.
+GNU General Public License v3.0 (GPL-3.0). See [LICENSE](LICENSE) for details.
