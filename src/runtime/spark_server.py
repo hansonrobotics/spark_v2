@@ -27,6 +27,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 import uuid
 import logging
 from datetime import datetime, timezone
@@ -64,6 +65,10 @@ logger = logging.getLogger("spark.server")
 
 DB_PATH = os.environ.get("SPARK_DB_PATH",
     os.path.join(_PROJECT_ROOT, "data", "spark.db"))
+BACKGROUND_PLANNER_REFRESH_SECONDS = max(
+    5.0,
+    float(os.environ.get("SPARK_BACKGROUND_PLANNER_REFRESH_SECONDS", "45")),
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SOPHIA MIND (hierarchical drives, persistent KG, auto-initiative)
@@ -91,6 +96,7 @@ class SophiaMindLive:
         self.chat_history: List[Dict[str, str]] = []
         self.last_topic_shift: bool = False
         self.background_planner_task: Optional[asyncio.Task] = None
+        self.last_background_planner_refresh: float = 0.0
 
         self.kg.insert_quad("sophia", "started_session", self.session_id)
         logger.info(f"SophiaMind initialized. Session: {self.session_id}, "
@@ -431,17 +437,28 @@ class SophiaMindLive:
             return
         if self.background_planner_task and not self.background_planner_task.done():
             return
+        now = time.monotonic()
+        if (
+            self.last_background_planner_refresh
+            and now - self.last_background_planner_refresh
+            < BACKGROUND_PLANNER_REFRESH_SECONDS
+        ):
+            return
+        self.last_background_planner_refresh = now
         context = self.get_initiative_context()
         async def _run_refresh():
-            updated = await self.planner.background_refresh(
-                self.active_person["person_id"],
-                self.unified_plan,
-                context,
-                llm_client=llm_client,
-            )
-            if updated is not None:
-                self.unified_plan = updated
-                self.last_decision = updated.last_decision
+            try:
+                updated = await self.planner.background_refresh(
+                    self.active_person["person_id"],
+                    self.unified_plan,
+                    context,
+                    llm_client=llm_client,
+                )
+                if updated is not None:
+                    self.unified_plan = updated
+                    self.last_decision = updated.last_decision
+            except Exception:
+                logger.exception("Background planner refresh failed")
 
         self.background_planner_task = asyncio.create_task(_run_refresh())
 
@@ -468,8 +485,7 @@ async def lifespan(app: FastAPI):
     global mind, drive_task, llm_client
     mind = SophiaMindLive()
     llm_client = get_llm_client()
-    await mind.begin_conversation("David", llm_client=llm_client)
-    mind.schedule_background_planner(llm_client)
+    await mind.begin_conversation("David", llm_client=None)
     drive_task = asyncio.create_task(drive_loop())
     logger.info("SPARK server started with drive system active")
     yield
@@ -524,6 +540,8 @@ async def drive_loop():
                     except Exception:
                         active_websockets.remove(ws)
 
+            mind.schedule_background_planner(llm_client)
+
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -561,7 +579,7 @@ async def websocket_chat(ws: WebSocket):
 
             if msg.get("type") == "user_message":
                 text = msg["text"]
-                ctx = await mind.process_message(text, llm_client=llm_client)
+                ctx = await mind.process_message(text, llm_client=None)
                 prompt_payload = render_sophia_prompt(ctx)
                 prompt = prompt_payload["user"]
 
