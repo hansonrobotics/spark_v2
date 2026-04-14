@@ -15,8 +15,20 @@ fi
 export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
 
 # Database location
-export SPARK_DB_PATH="${SPARK_DB_PATH:-$SCRIPT_DIR/spark_data/spark.db}"
+if [ -n "${HR_CONFIG_STORAGE:-}" ]; then
+    export SPARK_RUNTIME_DIR="${SPARK_RUNTIME_DIR:-${HR_CONFIG_STORAGE}/tmp/spark}"
+    export SPARK_SEED_DB_PATH="${SPARK_SEED_DB_PATH:-${HR_CONFIG_STORAGE}/scripts/spark/seed/spark.db}"
+else
+    export SPARK_RUNTIME_DIR="${SPARK_RUNTIME_DIR:-$SCRIPT_DIR/spark_data}"
+    export SPARK_SEED_DB_PATH="${SPARK_SEED_DB_PATH:-$SCRIPT_DIR/data/spark.db}"
+fi
+export SPARK_DB_PATH="${SPARK_DB_PATH:-$SPARK_RUNTIME_DIR/spark.db}"
 mkdir -p "$(dirname "$SPARK_DB_PATH")"
+
+if [ ! -f "$SPARK_DB_PATH" ] && [ -f "$SPARK_SEED_DB_PATH" ]; then
+    cp "$SPARK_SEED_DB_PATH" "$SPARK_DB_PATH"
+    echo "Seeded database from $SPARK_SEED_DB_PATH"
+fi
 
 # Port
 PORT="${SPARK_PORT:-8080}"

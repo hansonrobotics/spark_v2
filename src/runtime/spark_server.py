@@ -83,6 +83,8 @@ class SophiaMindLive:
         self.drives = HierarchicalDriveSystem()
         self.cognitive_loop = UnifiedCognitiveLoop()
         self.session_id = str(uuid.uuid4())[:8]
+        self.started_at = datetime.now(timezone.utc).isoformat()
+        self.started_monotonic = time.monotonic()
         self.conversation_turn = 0
         self.active_person: Optional[dict] = None
         self.topics: List[str] = []
@@ -490,6 +492,20 @@ def websocket_message_metadata(msg: Dict[str, Any]) -> Dict[str, Any]:
         "auto_log": msg.get("auto_log", True),
     }
 
+
+def spark_usage_stats() -> Dict[str, Any]:
+    """Return live server/runtime stats for the web UI."""
+    usage = llm_client.get_usage_stats() if llm_client else {}
+    elapsed = time.monotonic() - mind.started_monotonic if mind else 0.0
+    return {
+        "input_tokens": usage.get("total_input_tokens", 0),
+        "output_tokens": usage.get("total_output_tokens", 0),
+        "total_calls": usage.get("total_calls", 0),
+        "elapsed_seconds": int(elapsed),
+        "started_at": mind.started_at if mind else None,
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global mind, drive_task, llm_client
@@ -543,6 +559,7 @@ async def drive_loop():
                 msg = mind.handle_drive_signal(signal)
                 if msg is None:
                     continue
+                msg["usage_stats"] = spark_usage_stats()
                 payload = json.dumps(msg)
                 for ws in list(active_websockets):
                     try:
@@ -580,6 +597,7 @@ async def websocket_chat(ws: WebSocket):
             mind.unified_plan.execution.to_dict() if mind.unified_plan else {}
         ),
         "last_decision": mind.last_decision.to_dict() if mind.last_decision else {},
+        "usage_stats": spark_usage_stats(),
     }))
 
     try:
@@ -612,6 +630,7 @@ async def websocket_chat(ws: WebSocket):
                     "prompt_length": len(prompt),
                     "prompt": prompt,
                     "person_familiarity": ctx["person"].get("familiarity", 0),
+                    "usage_stats": spark_usage_stats(),
                 }))
 
                 response = await llm_client.complete(
@@ -635,6 +654,7 @@ async def websocket_chat(ws: WebSocket):
                         "turn": ctx["conversation_turn"],
                         "quads_in_kg": mind.kg.count_quads(),
                         "drives": mind.drives.to_dict(),
+                        "usage_stats": spark_usage_stats(),
                     }))
                 else:
                     logger.error(
@@ -650,6 +670,7 @@ async def websocket_chat(ws: WebSocket):
                         "turn": ctx["conversation_turn"],
                         "error": response.stop_reason or "llm_generation_failed",
                         "details": (response.raw or {}).get("error", "No text returned."),
+                        "usage_stats": spark_usage_stats(),
                     }))
 
             elif msg.get("type") == "sophia_response":
@@ -685,6 +706,7 @@ async def status():
         "last_decision": mind.last_decision.to_dict() if mind and mind.last_decision else {},
         "topics": mind.topics if mind else [],
         "person": mind.active_person if mind else None,
+        "usage_stats": spark_usage_stats(),
     }
 
 @app.get("/api/kg/recent")
@@ -769,6 +791,7 @@ h3 { color: #7aa2f7; margin: 12px 0 8px; font-size: 13px; text-transform: upperc
 .fill.high { background: #ef4444; }
 #emotion-display { font-size: 18px; text-align: center; padding: 8px; margin: 8px 0; background: #1a1a24; border-radius: 8px; }
 #meta { font-size: 11px; color: #666; padding: 4px 0; }
+#usage-stats { font-size: 11px; color: #8b93a7; padding: 0 0 6px; line-height: 1.45; }
 .tab-row { display: flex; gap: 8px; margin: 12px 0; }
 .tab-btn { flex: 1; background: #181824; color: #9aa4bf; border: 1px solid #2a2a36; border-radius: 8px; padding: 8px 10px; font-size: 12px; cursor: pointer; }
 .tab-btn.active { background: #2563eb; color: #fff; border-color: #2563eb; }
@@ -792,6 +815,7 @@ h3 { color: #7aa2f7; margin: 12px 0 8px; font-size: 13px; text-transform: upperc
   <h2 style="color:#7aa2f7;margin-bottom:12px;">SPARK v2</h2>
   <div id="emotion-display">...</div>
   <div id="meta">Session: ... | Quads: 0 | Turn: 0</div>
+  <div id="usage-stats">Input tokens: 0 | Output tokens: 0 | Time: 00:00</div>
   <div class="tab-row">
     <button id="tab-state" class="tab-btn active" onclick="showTab('state')">State</button>
     <button id="tab-context" class="tab-btn" onclick="showTab('context')">Context</button>
@@ -858,6 +882,35 @@ const msgInput = document.getElementById('msg');
 let sessionId = '...';
 let promptCatalog = [];
 let currentPromptId = '';
+let latestUsageStats = {
+  input_tokens: 0,
+  output_tokens: 0,
+  elapsed_seconds: 0,
+};
+
+function formatNumber(value) {
+  return Number(value || 0).toLocaleString();
+}
+
+function formatDuration(totalSeconds) {
+  const seconds = Math.max(0, Math.floor(Number(totalSeconds || 0)));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  const mm = String(minutes).padStart(2, '0');
+  const ss = String(secs).padStart(2, '0');
+  if (hours > 0) return `${hours}:${mm}:${ss}`;
+  return `${mm}:${ss}`;
+}
+
+function updateUsageStats(stats) {
+  if (!stats) return;
+  latestUsageStats = { ...latestUsageStats, ...stats };
+  document.getElementById('usage-stats').textContent =
+    `Input tokens: ${formatNumber(latestUsageStats.input_tokens)} | ` +
+    `Output tokens: ${formatNumber(latestUsageStats.output_tokens)} | ` +
+    `Time: ${formatDuration(latestUsageStats.elapsed_seconds)}`;
+}
 
 function pretty(value) {
   if (!value || (typeof value === 'object' && Object.keys(value).length === 0)) {
@@ -1049,6 +1102,16 @@ async function reloadPrompts() {
   }
 }
 
+async function refreshStatusStats() {
+  try {
+    const res = await fetch('/api/status');
+    const data = await res.json();
+    updateUsageStats(data.usage_stats);
+  } catch (_) {
+    updateUsageStats(latestUsageStats);
+  }
+}
+
 ws.onmessage = (e) => {
   const msg = JSON.parse(e.data);
 
@@ -1056,6 +1119,7 @@ ws.onmessage = (e) => {
     sessionId = msg.session_id || sessionId;
     document.getElementById('meta').textContent =
       `Session: ${sessionId} | Quads: ${msg.quads_in_kg} | Turn: 0`;
+    updateUsageStats(msg.usage_stats);
     if (msg.drives) updateDrives(msg.drives);
     updatePlannerPanels(msg);
     document.getElementById('unified-plan-view').textContent = pretty(msg.unified_plan);
@@ -1065,6 +1129,7 @@ ws.onmessage = (e) => {
     updateDrives(msg.drives);
     document.getElementById('meta').textContent =
       `Session: ${sessionId} | Quads: ${msg.quads_in_kg} | Turn: ${msg.turn}`;
+    updateUsageStats(msg.usage_stats);
     updatePlannerPanels(msg);
     document.getElementById('topics').textContent = msg.topics.join(', ') || 'none';
     document.getElementById('tkg-facts').innerHTML =
@@ -1080,6 +1145,7 @@ ws.onmessage = (e) => {
   }
 
   if (msg.type === 'planner_absorbed_drive') {
+    updateUsageStats(msg.usage_stats);
     addMsg(`[Planner absorbed ${msg.layer}:${msg.trigger} into beat ${msg.beat_id || 'none'}]`,
            'sophia', 'Planner');
   }
@@ -1088,6 +1154,7 @@ ws.onmessage = (e) => {
     updateDrives(msg.drives);
     document.getElementById('meta').textContent =
       `Session: ${sessionId} | Quads: ${msg.quads_in_kg} | Turn: ${msg.turn}`;
+    updateUsageStats(msg.usage_stats);
     addMsg(msg.sophia_message, 'sophia self-init',
            `SELF-INITIATED (${msg.trigger}) — turn ${msg.turn}`);
   }
@@ -1096,10 +1163,12 @@ ws.onmessage = (e) => {
     updateDrives(msg.drives);
     document.getElementById('meta').textContent =
       `Session: ${sessionId} | Quads: ${msg.quads_in_kg} | Turn: ${msg.turn}`;
+    updateUsageStats(msg.usage_stats);
     addMsg(msg.text, 'sophia', `Sophia • ${msg.model}`);
   }
 
   if (msg.type === 'sophia_error') {
+    updateUsageStats(msg.usage_stats);
     addMsg(`[Response generation failed: ${msg.error}. ${msg.details}]`,
            'sophia', 'Model Error');
   }
@@ -1113,6 +1182,11 @@ function send() {
   msgInput.value = '';
 }
 msgInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+setInterval(() => {
+  latestUsageStats.elapsed_seconds += 1;
+  updateUsageStats(latestUsageStats);
+}, 1000);
+setInterval(refreshStatusStats, 5000);
 loadPrompts();
 </script>
 </body></html>"""
