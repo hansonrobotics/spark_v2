@@ -480,6 +480,16 @@ class PromptUpdateRequest(BaseModel):
     system_template: Optional[str] = None
     user_template: Optional[str] = None
 
+
+def websocket_message_metadata(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract optional ROS/client metadata from a WebSocket message."""
+    return {
+        "request_id": msg.get("request_id", ""),
+        "session": msg.get("session", ""),
+        "lang": msg.get("lang", ""),
+        "auto_log": msg.get("auto_log", True),
+    }
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global mind, drive_task, llm_client
@@ -579,12 +589,16 @@ async def websocket_chat(ws: WebSocket):
 
             if msg.get("type") == "user_message":
                 text = msg["text"]
+                metadata = websocket_message_metadata(msg)
                 ctx = await mind.process_message(text, llm_client=None)
                 prompt_payload = render_sophia_prompt(ctx)
                 prompt = prompt_payload["user"]
 
                 await ws.send_text(json.dumps({
                     "type": "context_assembled",
+                    "request_id": metadata["request_id"],
+                    "session": metadata["session"],
+                    "lang": metadata["lang"],
                     "turn": ctx["conversation_turn"],
                     "unified_plan": ctx["unified_plan"],
                     "narrative": ctx["narrative"],
@@ -607,10 +621,15 @@ async def websocket_chat(ws: WebSocket):
                     max_tokens=400,
                 )
                 if response.text:
-                    mind.log_response(response.text)
+                    if metadata["auto_log"]:
+                        mind.log_response(response.text)
                     mind.schedule_background_planner(llm_client)
                     await ws.send_text(json.dumps({
                         "type": "sophia_reply",
+                        "request_id": metadata["request_id"],
+                        "session": metadata["session"],
+                        "lang": metadata["lang"],
+                        "response_id": str(uuid.uuid4()),
                         "text": response.text,
                         "model": response.model,
                         "turn": ctx["conversation_turn"],
@@ -625,13 +644,18 @@ async def websocket_chat(ws: WebSocket):
                     )
                     await ws.send_text(json.dumps({
                         "type": "sophia_error",
+                        "request_id": metadata["request_id"],
+                        "session": metadata["session"],
+                        "lang": metadata["lang"],
                         "turn": ctx["conversation_turn"],
                         "error": response.stop_reason or "llm_generation_failed",
                         "details": (response.raw or {}).get("error", "No text returned."),
                     }))
 
             elif msg.get("type") == "sophia_response":
-                mind.log_response(msg.get("text", ""))
+                text = msg.get("text", "")
+                if text:
+                    mind.log_response(text)
 
     except WebSocketDisconnect:
         active_websockets.remove(ws)
