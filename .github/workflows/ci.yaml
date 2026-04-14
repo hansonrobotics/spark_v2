@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags:
+      - "*"
+  workflow_dispatch:
+
+env:
+  AWS_ROLE_ARN: arn:aws:iam::222132024866:role/oidc-staging-github-actions-role
+  AWS_REGION: ap-east-1
+  ECR_REPOSITORY: 222132024866.dkr.ecr.ap-east-1.amazonaws.com/hansonrobotics/spark-v2
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-amd64:
+    runs-on: [self-hosted]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GithubActionECR
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Prepare Docker tags
+        id: docker-tags
+        shell: bash
+        run: |
+          ref_tag="$(printf '%s' "${GITHUB_REF_NAME}" | sed -E 's#[^A-Za-z0-9_.-]+#-#g; s#^[^A-Za-z0-9_]+##' | cut -c1-128)"
+          if [ -z "$ref_tag" ]; then
+            ref_tag="${GITHUB_SHA}"
+          fi
+          {
+            echo "ref-tag=${ref_tag}"
+            echo "tags<<EOF"
+            echo "${ECR_REPOSITORY}:latest"
+            echo "${ECR_REPOSITORY}:${GITHUB_SHA}"
+            echo "${ECR_REPOSITORY}:${ref_tag}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push AMD64
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: config/docker/Dockerfile.service
+          platforms: linux/amd64
+          cache-from: |
+            type=registry,ref=${{ env.ECR_REPOSITORY }}:buildcache-amd64
+            type=gha
+          cache-to: type=registry,ref=${{ env.ECR_REPOSITORY }}:buildcache-amd64,mode=max
+          push: true
+          tags: ${{ steps.docker-tags.outputs.tags }}
