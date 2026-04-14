@@ -33,7 +33,9 @@ fi
 # Port
 PORT="${SPARK_PORT:-8588}"
 SQLITE_WEB_PORT="${SPARK_SQLITE_WEB_PORT:-8589}"
+SQLITE_WEB_URL_PREFIX="${SPARK_SQLITE_WEB_URL_PREFIX:-}"
 LOG_LEVEL="${SPARK_LOG_LEVEL:-warning}"
+ROOT_PATH="${SPARK_ROOT_PATH:-}"
 
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║            SPARK v2 — Sophia Live Server             ║"
@@ -42,23 +44,32 @@ echo "║  Database: $SPARK_DB_PATH"
 echo "║  Server:   http://0.0.0.0:$PORT"
 echo "║  Chat UI:  http://localhost:$PORT"
 echo "║  SQLite:   http://localhost:$SQLITE_WEB_PORT"
+echo "║  Root path:${ROOT_PATH:-/}"
+echo "║  DB UI:    ${SQLITE_WEB_URL_PREFIX:-/}"
 echo "║                                                      ║"
 echo "║  Press Ctrl+C to stop                                ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
 
-if command -v sqlite_web >/dev/null 2>&1; then
-    sqlite_web \
-        --host 0.0.0.0 \
-        --port "$SQLITE_WEB_PORT" \
-        --no-browser \
-        --quiet \
-        --read-only \
-        "$SPARK_DB_PATH" \
-        >/tmp/spark-sqlite-web.log 2>&1 &
-else
-    echo "sqlite_web is not installed; database inspector disabled"
+if ! command -v sqlite_web >/dev/null 2>&1; then
+    echo "sqlite_web is required but not installed"
+    exit 1
 fi
+
+sqlite_web_args=(
+    --host 0.0.0.0
+    --port "$SQLITE_WEB_PORT"
+    --no-browser
+    --quiet
+)
+if [ -n "$SQLITE_WEB_URL_PREFIX" ]; then
+    sqlite_web_args+=(--url-prefix "$SQLITE_WEB_URL_PREFIX")
+fi
+
+sqlite_web \
+    "${sqlite_web_args[@]}" \
+    "$SPARK_DB_PATH" \
+    >/tmp/spark-sqlite-web.log 2>&1 &
 
 exec python3.10  -m uvicorn src.runtime.spark_server:app \
     --host 0.0.0.0 \

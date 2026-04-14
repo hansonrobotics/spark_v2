@@ -69,11 +69,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger("spark.server")
 
+def normalize_root_path(value: Optional[str]) -> str:
+    """Normalize a configured proxy mount path for FastAPI and templates."""
+    if not value:
+        return ""
+    stripped = value.strip()
+    if not stripped or stripped == "/":
+        return ""
+    return f"/{stripped.strip('/')}"
+
+
+def root_path_mount(value: Optional[str]) -> str:
+    """Return a browser-facing mount path that always ends with a slash."""
+    normalized = normalize_root_path(value)
+    return f"{normalized}/" if normalized else "/"
+
+
 DB_PATH = os.environ.get("SPARK_DB_PATH",
     os.path.join(_PROJECT_ROOT, "data", "spark.db"))
+SPARK_ROOT_PATH = normalize_root_path(os.environ.get("SPARK_ROOT_PATH", ""))
 BACKGROUND_PLANNER_REFRESH_SECONDS = max(
     5.0,
     float(os.environ.get("SPARK_BACKGROUND_PLANNER_REFRESH_SECONDS", "45")),
+)
+SELF_INITIATED_MIN_INTERVAL_SECONDS = max(
+    5.0,
+    float(os.environ.get("SPARK_SELF_INITIATED_MIN_INTERVAL_SECONDS", "20")),
+)
+SELF_INITIATED_BACKOFF_MULTIPLIER = max(
+    1.0,
+    float(os.environ.get("SPARK_SELF_INITIATED_BACKOFF_MULTIPLIER", "1.8")),
+)
+SELF_INITIATED_MAX_TURNS_PER_IDLE = max(
+    1,
+    int(os.environ.get("SPARK_SELF_INITIATED_MAX_TURNS_PER_IDLE", "3")),
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -105,6 +134,9 @@ class SophiaMindLive:
         self.last_topic_shift: bool = False
         self.background_planner_task: Optional[asyncio.Task] = None
         self.last_background_planner_refresh: float = 0.0
+        self.self_initiated_turns_since_user_input: int = 0
+        self.self_initiated_dormant: bool = False
+        self.next_self_initiated_allowed_at: float = 0.0
 
         self.kg.insert_quad("sophia", "started_session", self.session_id)
         logger.info(f"SophiaMind initialized. Session: {self.session_id}, "
@@ -132,6 +164,7 @@ class SophiaMindLive:
 
     async def begin_conversation(self, person_name: str,
                                  llm_client: Optional[SparkLLMClient] = None) -> dict:
+        self.reset_self_initiated_dialogue()
         pid = person_name.lower().replace(" ", "_")
         self.active_person = self.kg.get_or_create_person(pid, person_name)
         history = self.kg.query_pair("sophia", pid, limit=50)
@@ -168,6 +201,7 @@ class SophiaMindLive:
 
     async def process_message(self, message: str,
                               llm_client: Optional[SparkLLMClient] = None) -> dict:
+        self.reset_self_initiated_dialogue()
         self.conversation_turn += 1
         pid = self.active_person["person_id"] if self.active_person else "unknown"
         self._record_chat_event("user", message)
@@ -279,6 +313,35 @@ class SophiaMindLive:
         )
         return self.assemble_context(message, reflex)
 
+    def reset_self_initiated_dialogue(self):
+        """Wake autonomous dialogue when a real user message arrives."""
+        self.self_initiated_turns_since_user_input = 0
+        self.self_initiated_dormant = False
+        self.next_self_initiated_allowed_at = 0.0
+
+    def can_emit_self_initiated_dialogue(
+        self, now: Optional[float] = None
+    ) -> bool:
+        """Global guardrail for autonomous speech across all drive layers."""
+        current = time.monotonic() if now is None else now
+        if self.self_initiated_dormant:
+            return False
+        return current >= self.next_self_initiated_allowed_at
+
+    def mark_self_initiated_dialogue_emitted(
+        self, now: Optional[float] = None
+    ) -> None:
+        """Back off autonomous timing and enter dormancy after a few turns."""
+        current = time.monotonic() if now is None else now
+        self.self_initiated_turns_since_user_input += 1
+        turns = self.self_initiated_turns_since_user_input
+        interval = SELF_INITIATED_MIN_INTERVAL_SECONDS * (
+            SELF_INITIATED_BACKOFF_MULTIPLIER ** max(0, turns - 1)
+        )
+        self.next_self_initiated_allowed_at = current + interval
+        if turns >= SELF_INITIATED_MAX_TURNS_PER_IDLE:
+            self.self_initiated_dormant = True
+
     def assemble_context(self, message: str,
                           reflex: Optional[DriveSignal] = None) -> dict:
         pid = self.active_person["person_id"] if self.active_person else "unknown"
@@ -325,6 +388,13 @@ class SophiaMindLive:
             "total_quads_in_kg": self.kg.count_quads(),
             "self_state_history": [],
             "drives": self.drives.get_state(),
+            "self_initiated": {
+                "turns_since_user_input": self.self_initiated_turns_since_user_input,
+                "dormant": self.self_initiated_dormant,
+                "next_allowed_in_seconds": max(
+                    0.0, self.next_self_initiated_allowed_at - time.monotonic()
+                ),
+            },
             "reflex_fired": reflex.trigger if reflex else None,
             "recent_chat_history": list(self.chat_history[-8:]),
             "topic_shift": self.last_topic_shift,
@@ -353,6 +423,13 @@ class SophiaMindLive:
             "recent_chat_history": list(self.chat_history[-8:]),
             "temporal_facts_with_person": temporal,
             "drives": self.drives.get_state(),
+            "self_initiated": {
+                "turns_since_user_input": self.self_initiated_turns_since_user_input,
+                "dormant": self.self_initiated_dormant,
+                "next_allowed_in_seconds": max(
+                    0.0, self.next_self_initiated_allowed_at - time.monotonic()
+                ),
+            },
         }
 
     def log_response(self, text: str, was_successful: bool = True):
@@ -527,7 +604,11 @@ async def lifespan(app: FastAPI):
     mind.kg.close()
     mind.planner.close()
 
-app = FastAPI(title="SPARK v2 Live Server", lifespan=lifespan)
+app = FastAPI(
+    title="SPARK v2 Live Server",
+    lifespan=lifespan,
+    root_path=SPARK_ROOT_PATH,
+)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
                    allow_headers=["*"])
 
@@ -558,10 +639,13 @@ async def drive_loop():
 
             # 3. If a drive signal fired, emit it
             if signal and active_websockets:
+                if not mind.can_emit_self_initiated_dialogue():
+                    continue
                 mind.last_signal_layer = signal.layer.name.lower()
                 msg = mind.handle_drive_signal(signal)
                 if msg is None:
                     continue
+                mind.mark_self_initiated_dialogue_emitted()
                 msg["usage_stats"] = spark_usage_stats()
                 payload = json.dumps(msg)
                 for ws in list(active_websockets):
@@ -601,6 +685,13 @@ async def websocket_chat(ws: WebSocket):
         ),
         "last_decision": mind.last_decision.to_dict() if mind.last_decision else {},
         "usage_stats": spark_usage_stats(),
+        "self_initiated": {
+            "turns_since_user_input": mind.self_initiated_turns_since_user_input,
+            "dormant": mind.self_initiated_dormant,
+            "next_allowed_in_seconds": max(
+                0.0, mind.next_self_initiated_allowed_at - time.monotonic()
+            ),
+        },
     }))
 
     try:
@@ -690,7 +781,7 @@ async def websocket_chat(ws: WebSocket):
 
 @app.get("/")
 async def root():
-    return HTMLResponse(CHAT_HTML)
+    return HTMLResponse(render_chat_html())
 
 @app.get("/api/status")
 async def status():
@@ -710,6 +801,13 @@ async def status():
         "topics": mind.topics if mind else [],
         "person": mind.active_person if mind else None,
         "usage_stats": spark_usage_stats(),
+        "self_initiated": {
+            "turns_since_user_input": mind.self_initiated_turns_since_user_input,
+            "dormant": mind.self_initiated_dormant,
+            "next_allowed_in_seconds": max(
+                0.0, mind.next_self_initiated_allowed_at - time.monotonic()
+            ),
+        },
     }
 
 @app.get("/api/kg/recent")
@@ -876,10 +974,36 @@ h3 { color: #7aa2f7; margin: 12px 0 8px; font-size: 13px; text-transform: upperc
   <div id="input-area">
     <input id="msg" placeholder="Talk to Sophia..." autofocus />
     <button onclick="send()">Send</button>
-  </div>
+</div>
 </div>
 <script>
-const ws = new WebSocket(`ws://${location.host}/ws/chat`);
+const configuredRootPath = __SPARK_ROOT_PATH__;
+function normalizeMountPath(path) {
+  if (!path || path === '/') return '/';
+  return `/${String(path).replace(/^\\/+|\\/+$/g, '')}/`;
+}
+
+function detectMountPath() {
+  if (configuredRootPath && configuredRootPath !== '/') {
+    return normalizeMountPath(configuredRootPath);
+  }
+  return normalizeMountPath(new URL('.', window.location.href).pathname);
+}
+
+const mountPath = detectMountPath();
+
+function appUrl(path) {
+  const relativePath = String(path || '').replace(/^\\/+/, '');
+  return new URL(`${mountPath}${relativePath}`, window.location.origin);
+}
+
+function websocketUrl(path) {
+  const url = appUrl(path);
+  url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return url;
+}
+
+const ws = new WebSocket(websocketUrl('ws/chat'));
 const chat = document.getElementById('chat');
 const msgInput = document.getElementById('msg');
 let sessionId = '...';
@@ -1058,7 +1182,7 @@ function selectPrompt(promptId) {
 
 async function loadPrompts(selectedId='') {
   try {
-    const res = await fetch('/api/prompts');
+    const res = await fetch(appUrl('api/prompts'));
     const data = await res.json();
     promptCatalog = data.prompts || [];
     document.getElementById('prompt-path').textContent = data.path || '(unknown path)';
@@ -1088,7 +1212,7 @@ async function savePrompt() {
     user_template: document.getElementById('prompt-user').value,
   };
   try {
-    const res = await fetch(`/api/prompts/${currentPromptId}`, {
+    const res = await fetch(appUrl(`api/prompts/${currentPromptId}`), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -1106,7 +1230,7 @@ async function savePrompt() {
 
 async function reloadPrompts() {
   try {
-    const res = await fetch('/api/prompts/reload', { method: 'POST' });
+    const res = await fetch(appUrl('api/prompts/reload'), { method: 'POST' });
     const data = await res.json();
     if (!res.ok) {
       throw new Error(data.detail || 'prompt reload failed');
@@ -1120,7 +1244,7 @@ async function reloadPrompts() {
 
 async function refreshStatusStats() {
   try {
-    const res = await fetch('/api/status');
+    const res = await fetch(appUrl('api/status'));
     const data = await res.json();
     updateUsageStats(data.usage_stats);
   } catch (_) {
@@ -1206,6 +1330,14 @@ setInterval(refreshStatusStats, 5000);
 loadPrompts();
 </script>
 </body></html>"""
+
+
+def render_chat_html(root_path: Optional[str] = None) -> str:
+    """Render the embedded chat UI with a normalized proxy mount hint."""
+    return CHAT_HTML.replace(
+        "__SPARK_ROOT_PATH__",
+        json.dumps(root_path_mount(SPARK_ROOT_PATH if root_path is None else root_path)),
+    )
 
 
 if __name__ == "__main__":
