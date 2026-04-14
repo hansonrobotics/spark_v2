@@ -133,7 +133,7 @@ chmod +x install.sh
 # 3. Start the server
 ./run.sh
 
-# 4. Open browser to http://localhost:8080
+# 4. Open browser to http://localhost:8588
 #    Chat with Sophia — she will self-initiate when you go quiet
 ```
 
@@ -141,13 +141,14 @@ chmod +x install.sh
 
 When running, the server provides:
 
-- **Web chat UI** at `http://localhost:8080` with:
+- **Web chat UI** at `http://localhost:8588` with:
   - Real-time conversation with Sophia
   - Live drive dashboard (sidebar) showing all 5 layers
   - Emotion display
   - Topic tracking
   - HTN plan display
   - Recent TKG facts
+- **SQLite inspector** at `http://localhost:8589` for live database inspection.
 
 - **Background drive loop** ticking every second:
   - All 5 hierarchical drive layers evolve
@@ -201,7 +202,7 @@ For tomorrow's session with Vytas, option 3 is the fastest path to testing the d
 | Verify WebSocket chat works | Vytas | Open browser, send messages |
 | Verify drive system fires | Vytas | Wait 30s in silence, observe self-initiation |
 | Verify TKG persistence | Vytas | Restart server, check quads accumulate |
-| Test REST API | Vytas | `curl http://localhost:8080/api/status` |
+| Test REST API | Vytas | `curl http://localhost:8588/api/status` |
 | Identify LLM integration path | Vytas + Claude | How to connect to existing dialogue pipeline |
 | Report bugs and breakage | Vytas + Claude | Claude can debug live in chat |
 

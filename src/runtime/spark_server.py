@@ -60,7 +60,13 @@ from src.core.prompt_manager import (
     get_prompt_manager,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+_LOG_LEVEL = os.environ.get("SPARK_LOG_LEVEL", "WARNING").upper()
+if _LOG_LEVEL == "WARN":
+    _LOG_LEVEL = "WARNING"
+logging.basicConfig(
+    level=getattr(logging, _LOG_LEVEL, logging.WARNING),
+    format="%(asctime)s [%(name)s] %(message)s",
+)
 logger = logging.getLogger("spark.server")
 
 DB_PATH = os.environ.get("SPARK_DB_PATH",
@@ -403,14 +409,6 @@ class SophiaMindLive:
                 self.planner.store.save_plan(
                     self.active_person["person_id"], self.unified_plan
                 )
-            return {
-                "type": "planner_absorbed_drive",
-                "layer": signal.layer.name,
-                "trigger": signal.trigger,
-                "reason": reason,
-                "plan_id": self.unified_plan.plan_id if self.unified_plan else None,
-                "beat_id": self.unified_plan.narrative.beat_id if self.unified_plan else None,
-            }
         self._record_chat_event("assistant", signal.message, kind="self_initiated")
         self.kg.insert_quad("sophia", "self_initiated",
                             f"{signal.layer.name}:{signal.trigger}",
@@ -428,6 +426,11 @@ class SophiaMindLive:
             "quads_in_kg": self.kg.count_quads(),
             "turn": self.conversation_turn,
             "plan_id": self.unified_plan.plan_id if self.unified_plan else None,
+            "beat_id": (
+                self.unified_plan.narrative.beat_id if self.unified_plan else None
+            ),
+            "planner_absorbed": absorbed,
+            "absorption_reason": reason,
         }
 
     def schedule_background_planner(self, llm_client: Optional[SparkLLMClient]):
@@ -888,8 +891,21 @@ let latestUsageStats = {
   elapsed_seconds: 0,
 };
 
-function formatNumber(value) {
-  return Number(value || 0).toLocaleString();
+function formatTokenCount(value) {
+  const amount = Math.max(0, Number(value || 0));
+  const units = [
+    [1_000_000_000, 'G'],
+    [1_000_000, 'M'],
+    [1_000, 'K'],
+  ];
+  for (const [size, suffix] of units) {
+    if (amount >= size) {
+      const scaled = amount / size;
+      const rounded = scaled >= 10 ? Math.round(scaled) : Math.round(scaled * 10) / 10;
+      return `${String(rounded).replace(/\\.0$/, '')}${suffix}`;
+    }
+  }
+  return String(Math.round(amount));
 }
 
 function formatDuration(totalSeconds) {
@@ -907,8 +923,8 @@ function updateUsageStats(stats) {
   if (!stats) return;
   latestUsageStats = { ...latestUsageStats, ...stats };
   document.getElementById('usage-stats').textContent =
-    `Input tokens: ${formatNumber(latestUsageStats.input_tokens)} | ` +
-    `Output tokens: ${formatNumber(latestUsageStats.output_tokens)} | ` +
+    `Input tokens: ${formatTokenCount(latestUsageStats.input_tokens)} | ` +
+    `Output tokens: ${formatTokenCount(latestUsageStats.output_tokens)} | ` +
     `Time: ${formatDuration(latestUsageStats.elapsed_seconds)}`;
 }
 
@@ -1194,4 +1210,7 @@ loadPrompts();
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080, log_level="info")
+    _uvicorn_log_level = os.environ.get("SPARK_LOG_LEVEL", "warning").lower()
+    if _uvicorn_log_level == "warn":
+        _uvicorn_log_level = "warning"
+    uvicorn.run(app, host="0.0.0.0", port=8588, log_level=_uvicorn_log_level)

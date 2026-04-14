@@ -45,8 +45,8 @@ source venv/bin/activate
 echo ""
 echo "[3/5] Installing Python dependencies..."
 pip install --upgrade pip -q
-pip install fastapi uvicorn[standard] httpx aiosqlite -q
-echo "  Installed: fastapi, uvicorn, httpx, aiosqlite"
+pip install fastapi uvicorn[standard] httpx aiosqlite sqlite-web -q
+echo "  Installed: fastapi, uvicorn, httpx, aiosqlite, sqlite-web"
 
 # Optional: Anthropic SDK for LLM calls
 echo ""
@@ -69,7 +69,8 @@ echo "║  To start SPARK:                                     ║"
 echo "║    ./run.sh                                          ║"
 echo "║                                                      ║"
 echo "║  Then open:                                          ║"
-echo "║    http://localhost:8080                              ║"
+echo "║    http://localhost:8588                              ║"
+echo "║    http://localhost:8589  (SQLite inspector)          ║"
 echo "║                                                      ║"
 echo "║  Optional: Set API key for LLM responses:            ║"
 echo "║    export ANTHROPIC_API_KEY=sk-ant-...                ║"

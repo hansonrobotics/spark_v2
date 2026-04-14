@@ -18,6 +18,6 @@ COPY config/ config/
 # Create data directories
 RUN mkdir -p /data/autoresearch/{experiments,programs,results}
 
-EXPOSE 8000 8001 8002 8003 8004 8005 8006 8007 8008
+EXPOSE 8000 8001 8002 8003 8004 8005 8006 8007 8008 8588 8589
 
-CMD ["uvicorn", "src.api.gateway:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "src.api.gateway:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "warning"]

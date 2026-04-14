@@ -65,10 +65,11 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"  # optional override
 
 # Start the server
 cd spark-v2
-uvicorn src.runtime.spark_server:app --host 0.0.0.0 --port 8080
+uvicorn src.runtime.spark_server:app --host 0.0.0.0 --port 8588
 ```
 
-Open http://localhost:8080 — you'll see a chat UI with a real-time drive state dashboard.
+Open http://localhost:8588 — you'll see a chat UI with a real-time drive state dashboard.
+Open http://localhost:8589 — you'll see the live SQLite database inspector.
 
 ### Run Without a Server (Python API)
 
