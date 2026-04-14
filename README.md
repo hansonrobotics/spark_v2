@@ -48,7 +48,7 @@ The system is designed to work with ANY OpenAI-compatible LLM. It now defaults t
 
 ```bash
 cd spark-v2
-pip install fastapi uvicorn httpx aiosqlite
+pip install fastapi uvicorn httpx aiosqlite jinja2
 ```
 
 ### Run the Server
