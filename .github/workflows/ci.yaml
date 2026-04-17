@@ -47,8 +47,8 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     needs: prepare-tags
     env:
-      LOCAL_CACHE_PATH: ${{ env.LOCAL_BUILDX_CACHE_ROOT }}/amd64
-      LOCAL_CACHE_PATH_NEW: ${{ env.LOCAL_BUILDX_CACHE_ROOT }}/amd64-new
+      LOCAL_CACHE_PATH: /var/tmp/buildx-cache/spark-v2/amd64
+      LOCAL_CACHE_PATH_NEW: /var/tmp/buildx-cache/spark-v2/amd64-new
     steps:
       - uses: actions/checkout@v4
 
@@ -104,8 +104,8 @@ jobs:
     runs-on: [self-hosted, linux, ARM64]
     needs: prepare-tags
     env:
-      LOCAL_CACHE_PATH: ${{ env.LOCAL_BUILDX_CACHE_ROOT }}/arm64
-      LOCAL_CACHE_PATH_NEW: ${{ env.LOCAL_BUILDX_CACHE_ROOT }}/arm64-new
+      LOCAL_CACHE_PATH: /var/tmp/buildx-cache/spark-v2/arm64
+      LOCAL_CACHE_PATH_NEW: /var/tmp/buildx-cache/spark-v2/arm64-new
     steps:
       - uses: actions/checkout@v4
 
