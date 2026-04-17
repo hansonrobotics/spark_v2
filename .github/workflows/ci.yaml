@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   build-amd64:
-    runs-on: [self-hosted]
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
 
