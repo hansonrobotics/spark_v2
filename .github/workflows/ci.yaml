@@ -15,8 +15,36 @@ permissions:
   contents: read
 
 jobs:
+  prepare-tags:
+    runs-on: [self-hosted, linux, x64]
+    outputs:
+      ref_tag: ${{ steps.docker-tags.outputs.ref_tag }}
+      final_tags: ${{ steps.docker-tags.outputs.final_tags }}
+      amd64_source_tag: ${{ steps.docker-tags.outputs.amd64_source_tag }}
+      arm64_source_tag: ${{ steps.docker-tags.outputs.arm64_source_tag }}
+    steps:
+      - name: Prepare Docker tags
+        id: docker-tags
+        shell: bash
+        run: |
+          ref_tag="$(printf '%s' "${GITHUB_REF_NAME}" | sed -E 's#[^A-Za-z0-9_.-]+#-#g; s#^[^A-Za-z0-9_]+##' | cut -c1-128)"
+          if [ -z "$ref_tag" ]; then
+            ref_tag="${GITHUB_SHA}"
+          fi
+          {
+            echo "ref_tag=${ref_tag}"
+            echo "amd64_source_tag=${ECR_REPOSITORY}:build-${GITHUB_SHA}-amd64"
+            echo "arm64_source_tag=${ECR_REPOSITORY}:build-${GITHUB_SHA}-arm64"
+            echo "final_tags<<EOF"
+            echo "${ECR_REPOSITORY}:latest"
+            echo "${ECR_REPOSITORY}:${GITHUB_SHA}"
+            echo "${ECR_REPOSITORY}:${ref_tag}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
   build-amd64:
     runs-on: [self-hosted, linux, x64]
+    needs: prepare-tags
     steps:
       - uses: actions/checkout@v4
 
@@ -33,23 +61,6 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Prepare Docker tags
-        id: docker-tags
-        shell: bash
-        run: |
-          ref_tag="$(printf '%s' "${GITHUB_REF_NAME}" | sed -E 's#[^A-Za-z0-9_.-]+#-#g; s#^[^A-Za-z0-9_]+##' | cut -c1-128)"
-          if [ -z "$ref_tag" ]; then
-            ref_tag="${GITHUB_SHA}"
-          fi
-          {
-            echo "ref-tag=${ref_tag}"
-            echo "tags<<EOF"
-            echo "${ECR_REPOSITORY}:latest"
-            echo "${ECR_REPOSITORY}:${GITHUB_SHA}"
-            echo "${ECR_REPOSITORY}:${ref_tag}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Build and push AMD64
         id: build
         uses: docker/build-push-action@v5
@@ -59,7 +70,89 @@ jobs:
           platforms: linux/amd64
           cache-from: |
             type=registry,ref=${{ env.ECR_REPOSITORY }}:buildcache-amd64
-            type=gha
-          cache-to: type=registry,ref=${{ env.ECR_REPOSITORY }}:buildcache-amd64,mode=max
+            type=gha,scope=spark-v2-amd64
+          cache-to: |
+            type=registry,ref=${{ env.ECR_REPOSITORY }}:buildcache-amd64,mode=max
+            type=gha,scope=spark-v2-amd64,mode=max
           push: true
-          tags: ${{ steps.docker-tags.outputs.tags }}
+          tags: ${{ needs.prepare-tags.outputs.amd64_source_tag }}
+
+  build-arm64:
+    runs-on: [self-hosted, linux, ARM64]
+    needs: prepare-tags
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GithubActionECR
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push ARM64
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: config/docker/Dockerfile.service
+          platforms: linux/arm64
+          cache-from: |
+            type=registry,ref=${{ env.ECR_REPOSITORY }}:buildcache-arm64
+            type=gha,scope=spark-v2-arm64
+          cache-to: |
+            type=registry,ref=${{ env.ECR_REPOSITORY }}:buildcache-arm64,mode=max
+            type=gha,scope=spark-v2-arm64,mode=max
+          push: true
+          tags: ${{ needs.prepare-tags.outputs.arm64_source_tag }}
+
+  publish-manifest:
+    runs-on: [self-hosted, linux, x64]
+    needs:
+      - prepare-tags
+      - build-amd64
+      - build-arm64
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GithubActionECR
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Publish multi-arch manifest
+        shell: bash
+        env:
+          FINAL_TAGS: ${{ needs.prepare-tags.outputs.final_tags }}
+          AMD64_SOURCE_TAG: ${{ needs.prepare-tags.outputs.amd64_source_tag }}
+          ARM64_SOURCE_TAG: ${{ needs.prepare-tags.outputs.arm64_source_tag }}
+        run: |
+          set -euo pipefail
+          tag_args=()
+          while IFS= read -r tag; do
+            if [ -n "${tag}" ]; then
+              tag_args+=(-t "${tag}")
+            fi
+          done <<< "${FINAL_TAGS}"
+
+          docker buildx imagetools create \
+            "${tag_args[@]}" \
+            "${AMD64_SOURCE_TAG}" \
+            "${ARM64_SOURCE_TAG}"
+
+          while IFS= read -r tag; do
+            if [ -n "${tag}" ]; then
+              docker buildx imagetools inspect "${tag}"
+            fi
+          done <<< "${FINAL_TAGS}"
