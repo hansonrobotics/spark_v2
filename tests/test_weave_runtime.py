@@ -195,6 +195,54 @@ async def test_background_refresh_updates_recurrence_state(tmp_path):
     planner.close()
 
 
+@pytest.mark.asyncio
+async def test_resume_existing_false_creates_fresh_plan_seeded_from_history(tmp_path):
+    planner = UnifiedPlanner(str(tmp_path / "planner.db"))
+    person_history = [{"relation": "discussed_topic", "object": "robotics"}]
+    first = await planner.create_or_resume_plan(
+        person_id="ada",
+        person_name="Ada",
+        familiarity=0.6,
+        person_history=person_history,
+    )
+    second = await planner.create_or_resume_plan(
+        person_id="ada",
+        person_name="Ada",
+        familiarity=0.6,
+        person_history=person_history,
+        resume_existing=False,
+    )
+    assert second.plan_id != first.plan_id
+    assert second.episode_id != first.episode_id
+    assert second.narrative.parameters["relationship_depth"] == 0.6
+    assert "recurring_topic:robotics" in second.narrative.b_plot_refs
+    planner.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_plan_is_not_resumed_automatically(tmp_path):
+    planner = UnifiedPlanner(str(tmp_path / "planner.db"))
+    plan = await planner.create_or_resume_plan(
+        person_id="iris",
+        person_name="Iris",
+        familiarity=0.3,
+        person_history=[],
+    )
+    plan.status = "completed"
+    plan.narrative.status = "completed"
+    planner.store.save_plan("iris", plan)
+
+    fresh = await planner.create_or_resume_plan(
+        person_id="iris",
+        person_name="Iris",
+        familiarity=0.3,
+        person_history=[],
+    )
+    assert fresh.plan_id != plan.plan_id
+    assert fresh.status == "active"
+    planner.close()
+
+
 def test_drive_signal_is_absorbed_into_unified_planner(tmp_path):
     planner = UnifiedPlanner(str(tmp_path / "planner.db"))
     plan = UnifiedPlan.from_dict({

@@ -27,7 +27,9 @@ class TemporalKGLite:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self.conn = sqlite3.connect(db_path)
+        # The live runtime may be exercised from FastAPI/TestClient threads
+        # that differ from the thread that created this helper.
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_db()
 

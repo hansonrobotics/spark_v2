@@ -1,10 +1,10 @@
 #!/bin/bash
-# SPARK v2 — Standalone Installer
+# SPARK v2 — Live Runtime Installer
 # Run: chmod +x install.sh && ./install.sh
 set -e
 
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║         SPARK v2 — Installer for Sophia             ║"
+echo "║         SPARK v2 — Live Runtime Installer           ║"
 echo "║         Hanson Robotics, March 2026                  ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
@@ -45,19 +45,19 @@ source venv/bin/activate
 echo ""
 echo "[3/5] Installing Python dependencies..."
 pip install --upgrade pip -q
-pip install fastapi uvicorn[standard] httpx aiosqlite sqlite-web -q
-echo "  Installed: fastapi, uvicorn, httpx, aiosqlite, sqlite-web"
+pip install -r requirements.txt -q
+echo "  Installed runtime dependencies from requirements.txt"
 
-# Optional: Anthropic SDK for LLM calls
+# Optional: test dependencies
 echo ""
-echo "[4/5] Optional: Anthropic API client..."
-pip install anthropic -q 2>/dev/null && echo "  Installed: anthropic" || echo "  Skipped (not critical for testing)"
+echo "[4/5] Optional: test dependencies..."
+echo "  Install with: pip install -r requirements-dev.txt"
 
 # Create data directory
 echo ""
 echo "[5/5] Creating data directory..."
 mkdir -p spark_data
-echo "  Created: spark_data/ (persistent TKG database will be stored here)"
+echo "  Created: spark_data/ (persistent SQLite runtime data will be stored here)"
 
 # Verify
 echo ""
@@ -68,13 +68,18 @@ echo "║                                                      ║"
 echo "║  To start SPARK:                                     ║"
 echo "║    ./run.sh                                          ║"
 echo "║                                                      ║"
+echo "║  To enable local tests:                              ║"
+echo "║    source venv/bin/activate                          ║"
+echo "║    pip install -r requirements-dev.txt               ║"
+echo "║    python -m pytest tests -q                         ║"
+echo "║                                                      ║"
 echo "║  Then open:                                          ║"
 echo "║    http://localhost:8588                              ║"
 echo "║    http://localhost:8589  (SQLite inspector)          ║"
 echo "║                                                      ║"
-echo "║  Optional: Set API key for LLM responses:            ║"
-echo "║    export ANTHROPIC_API_KEY=sk-ant-...                ║"
+echo "║  Optional: Set an LLM API key:                       ║"
+echo "║    export OPENAI_API_KEY=sk-...                       ║"
 echo "║                                                      ║"
-echo "║  For Vytas: read docs/DEVELOPMENT_PLAN.md            ║"
+echo "║  Read next: README.md                                ║"
 echo "║                                                      ║"
 echo "╚══════════════════════════════════════════════════════╝"

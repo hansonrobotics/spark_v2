@@ -26,6 +26,7 @@ Runs as a real FastAPI application on Ubuntu with:
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -104,6 +105,10 @@ SELF_INITIATED_MAX_TURNS_PER_IDLE = max(
     1,
     int(os.environ.get("SPARK_SELF_INITIATED_MAX_TURNS_PER_IDLE", "3")),
 )
+SESSION_IDLE_TIMEOUT_SECONDS = max(
+    60.0,
+    float(os.environ.get("SPARK_SESSION_IDLE_TIMEOUT_SECONDS", "1200")),
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SOPHIA MIND (hierarchical drives, persistent KG, auto-initiative)
@@ -117,9 +122,14 @@ class SophiaMindLive:
         self.planner = UnifiedPlanner(DB_PATH)
         self.drives = HierarchicalDriveSystem()
         self.cognitive_loop = UnifiedCognitiveLoop()
-        self.session_id = str(uuid.uuid4())[:8]
+        self.session_id: Optional[str] = None
         self.started_at = datetime.now(timezone.utc).isoformat()
         self.started_monotonic = time.monotonic()
+        self.session_active: bool = False
+        self.last_user_activity_monotonic: Optional[float] = None
+        self.closed_at: Optional[str] = None
+        self.close_reason: str = "not_started"
+        self.anonymous_session: bool = False
         self.conversation_turn = 0
         self.active_person: Optional[dict] = None
         self.topics: List[str] = []
@@ -138,8 +148,7 @@ class SophiaMindLive:
         self.self_initiated_dormant: bool = False
         self.next_self_initiated_allowed_at: float = 0.0
 
-        self.kg.insert_quad("sophia", "started_session", self.session_id)
-        logger.info(f"SophiaMind initialized. Session: {self.session_id}, "
+        logger.info("SophiaMind initialized. Active session: none, "
                     f"KG has {self.kg.count_quads()} quads")
 
     def _record_chat_event(self, role: str, text: str, kind: str = "message"):
@@ -162,35 +171,130 @@ class SophiaMindLive:
         self.kg.close()
         self.planner.close()
 
-    async def begin_conversation(self, person_name: str,
-                                 llm_client: Optional[SparkLLMClient] = None) -> dict:
+    @staticmethod
+    def _normalize_person_id(person_name: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "_", person_name.lower()).strip("_")
+        return slug or "unknown"
+
+    def _reset_live_runtime_state(self):
+        """Reset all per-session live state while preserving persistent KG memory."""
+        if self.background_planner_task and not self.background_planner_task.done():
+            self.background_planner_task.cancel()
+        self.background_planner_task = None
+        self.drives = HierarchicalDriveSystem()
+        self.cognitive_loop = UnifiedCognitiveLoop()
+        self.conversation_turn = 0
+        self.active_person = None
+        self.topics = []
+        self.active_goals = ["engage_socially", "learn_about_partner"]
+        self.unified_plan = None
+        self.last_decision = None
+        self.methods_invented = []
+        self.selected_actions = []
+        self.previous_topic = ""
+        self.last_signal_layer = None
+        self.chat_history = []
+        self.last_topic_shift = False
+        self.last_background_planner_refresh = 0.0
         self.reset_self_initiated_dialogue()
-        pid = person_name.lower().replace(" ", "_")
-        self.active_person = self.kg.get_or_create_person(pid, person_name)
+
+    def mark_user_activity(self, now: Optional[float] = None) -> None:
+        self.last_user_activity_monotonic = time.monotonic() if now is None else now
+
+    def seconds_since_user_activity(
+        self, now: Optional[float] = None
+    ) -> Optional[float]:
+        if self.last_user_activity_monotonic is None:
+            return None
+        current = time.monotonic() if now is None else now
+        return max(0.0, current - self.last_user_activity_monotonic)
+
+    def session_timed_out(self, now: Optional[float] = None) -> bool:
+        if not self.session_active or self.last_user_activity_monotonic is None:
+            return False
+        current = time.monotonic() if now is None else now
+        return (
+            current - self.last_user_activity_monotonic
+            >= SESSION_IDLE_TIMEOUT_SECONDS
+        )
+
+    def detect_explicit_name(self, text: str) -> Optional[str]:
+        patterns = (
+            r"\bmy name is\s+([A-Za-z][A-Za-z'-]*(?:\s+[A-Za-z][A-Za-z'-]*)?)",
+            r"\bi am\s+([A-Za-z][A-Za-z'-]*(?:\s+[A-Za-z][A-Za-z'-]*)?)",
+            r"\bi'm\s+([A-Za-z][A-Za-z'-]*(?:\s+[A-Za-z][A-Za-z'-]*)?)",
+            r"\bcall me\s+([A-Za-z][A-Za-z'-]*(?:\s+[A-Za-z][A-Za-z'-]*)?)",
+        )
+        banned = {
+            "happy", "sad", "fine", "good", "okay", "ok", "back", "here",
+            "hungry", "tired", "ready", "human", "robot", "unknown",
+        }
+        lowered = text.strip().lower()
+        for pattern in patterns:
+            match = re.search(pattern, lowered, flags=re.IGNORECASE)
+            if not match:
+                continue
+            raw_name = match.group(1).strip(" .,!?")
+            parts = [part for part in raw_name.split() if part]
+            if not parts:
+                continue
+            if any(part in banned for part in parts):
+                continue
+            return " ".join(part.capitalize() for part in parts[:2])
+        return None
+
+    async def start_session(
+        self,
+        person_name: str,
+        anonymous: bool,
+        llm_client: Optional[SparkLLMClient] = None,
+        resume_existing: bool = False,
+        activity_time: Optional[float] = None,
+    ) -> dict:
+        self._reset_live_runtime_state()
+        self.session_id = str(uuid.uuid4())[:8]
+        self.session_active = True
+        self.anonymous_session = anonymous
+        self.closed_at = None
+        self.close_reason = ""
+        self.mark_user_activity(activity_time)
+
+        resolved_name = "Unknown" if anonymous else person_name.strip() or "Unknown"
+        if anonymous:
+            pid = f"unknown_{self.session_id}"
+        else:
+            pid = self._normalize_person_id(resolved_name)
+
+        self.active_person = self.kg.get_or_create_person(pid, resolved_name)
         history = self.kg.query_pair("sophia", pid, limit=50)
         conversations = [h for h in history if "conversed" in h.get("relation", "")]
         self.active_person["interaction_count"] = len(conversations)
         self.active_person["history"] = history
         fam = min(1.0, len(conversations) * 0.05 + self.active_person["familiarity"])
-        self.kg.update_person(pid, familiarity=fam,
-                               last_seen=datetime.now(timezone.utc).isoformat())
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self.kg.update_person(pid, familiarity=fam, last_seen=now_iso, name=resolved_name)
+        self.active_person["name"] = resolved_name
         self.active_person["familiarity"] = fam
+        self.kg.insert_quad("sophia", "started_session", self.session_id)
         self.kg.insert_quad("sophia", "conversed_with", pid)
         self.drives.initiative.conversation_active = True
         self.drives.initiative.on_input()
         self.drives.on_session_start(history, fam)
         self.unified_plan = await self.planner.create_or_resume_plan(
             person_id=pid,
-            person_name=person_name,
+            person_name=resolved_name,
             familiarity=fam,
             person_history=history,
             llm_client=llm_client,
+            resume_existing=resume_existing,
         )
         self.last_decision = self.unified_plan.last_decision
         self.selected_actions = list(self.unified_plan.execution.primitive_actions)
         self.active_goals = ["engage_socially", self.unified_plan.narrative.beat_goal]
         self.drives.deliberation.active_quest = self.unified_plan.narrative.beat_goal
-        self.drives.initiative.deliberation_goals = [self.unified_plan.narrative.beat_goal]
+        self.drives.initiative.deliberation_goals = [
+            self.unified_plan.narrative.beat_goal
+        ]
         self.kg.insert_quad("sophia", "started_story", self.unified_plan.episode_id)
         self.kg.insert_quad(
             self.unified_plan.episode_id,
@@ -199,8 +303,85 @@ class SophiaMindLive:
         )
         return self.active_person
 
+    async def ensure_session_for_message(
+        self,
+        text: str,
+        llm_client: Optional[SparkLLMClient] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        activity_time = time.monotonic() if now is None else now
+        explicit_name = self.detect_explicit_name(text)
+        if not self.session_active:
+            await self.start_session(
+                explicit_name or "Unknown",
+                anonymous=explicit_name is None,
+                llm_client=llm_client,
+                resume_existing=False,
+                activity_time=activity_time,
+            )
+            return True
+        if self.anonymous_session and explicit_name:
+            self.close_session(reason="identity_reintroduced")
+            await self.start_session(
+                explicit_name,
+                anonymous=False,
+                llm_client=llm_client,
+                resume_existing=False,
+                activity_time=activity_time,
+            )
+            return True
+        self.mark_user_activity(activity_time)
+        return False
+
+    def close_session(self, reason: str = "inactivity_timeout") -> Optional[dict]:
+        if not self.session_active:
+            return None
+        closed_session_id = self.session_id
+        closed_person = dict(self.active_person or {})
+        if self.unified_plan and self.active_person:
+            self.unified_plan.status = "completed"
+            self.unified_plan.narrative.status = "completed"
+            self.unified_plan.updated_at = datetime.now(timezone.utc).isoformat()
+            self.planner.store.save_plan(
+                self.active_person["person_id"], self.unified_plan
+            )
+            self.kg.insert_quad(
+                "sophia", "ended_story", self.unified_plan.episode_id, source="SYSTEM"
+            )
+        if closed_session_id:
+            self.kg.insert_quad(
+                "sophia", "ended_session", closed_session_id, source="SYSTEM"
+            )
+            self.kg.insert_quad(
+                closed_session_id, "close_reason", reason, source="SYSTEM"
+            )
+        self.session_active = False
+        self.anonymous_session = False
+        self.closed_at = datetime.now(timezone.utc).isoformat()
+        self.close_reason = reason
+        self._reset_live_runtime_state()
+        self.session_id = None
+        return {
+            "type": "session_closed",
+            "session_id": closed_session_id,
+            "reason": reason,
+            "closed_at": self.closed_at,
+            "person": closed_person or None,
+            "usage_stats": spark_usage_stats(),
+        }
+
+    async def begin_conversation(self, person_name: str,
+                                 llm_client: Optional[SparkLLMClient] = None) -> dict:
+        return await self.start_session(
+            person_name,
+            anonymous=False,
+            llm_client=llm_client,
+            resume_existing=True,
+        )
+
     async def process_message(self, message: str,
                               llm_client: Optional[SparkLLMClient] = None) -> dict:
+        self.mark_user_activity()
         self.reset_self_initiated_dialogue()
         self.conversation_turn += 1
         pid = self.active_person["person_id"] if self.active_person else "unknown"
@@ -323,6 +504,8 @@ class SophiaMindLive:
         self, now: Optional[float] = None
     ) -> bool:
         """Global guardrail for autonomous speech across all drive layers."""
+        if not self.session_active:
+            return False
         current = time.monotonic() if now is None else now
         if self.self_initiated_dormant:
             return False
@@ -477,6 +660,8 @@ class SophiaMindLive:
 
     def handle_drive_signal(self, signal: DriveSignal) -> Optional[dict]:
         """Convert a hierarchical drive signal into a message event."""
+        if not self.session_active:
+            return None
         absorbed, updated_plan, reason = self.planner.absorb_drive_signal(
             self.unified_plan, signal
         )
@@ -512,7 +697,8 @@ class SophiaMindLive:
 
     def schedule_background_planner(self, llm_client: Optional[SparkLLMClient]):
         if (
-            llm_client is None
+            not self.session_active
+            or llm_client is None
             or self.unified_plan is None
             or self.active_person is None
         ):
@@ -573,6 +759,60 @@ def websocket_message_metadata(msg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def session_state_snapshot(current_mind: Optional[SophiaMindLive]) -> Dict[str, Any]:
+    seconds_since_activity = (
+        current_mind.seconds_since_user_activity() if current_mind else None
+    )
+    next_allowed = 0.0
+    if current_mind:
+        next_allowed = max(
+            0.0, current_mind.next_self_initiated_allowed_at - time.monotonic()
+        )
+    return {
+        "session_active": current_mind.session_active if current_mind else False,
+        "anonymous_session": current_mind.anonymous_session if current_mind else False,
+        "close_reason": current_mind.close_reason if current_mind else "",
+        "closed_at": current_mind.closed_at if current_mind else None,
+        "idle_timeout_seconds": SESSION_IDLE_TIMEOUT_SECONDS,
+        "seconds_since_user_activity": seconds_since_activity,
+        "self_initiated": {
+            "turns_since_user_input": (
+                current_mind.self_initiated_turns_since_user_input if current_mind else 0
+            ),
+            "dormant": current_mind.self_initiated_dormant if current_mind else False,
+            "next_allowed_in_seconds": next_allowed,
+        },
+    }
+
+
+def init_payload(current_mind: SophiaMindLive) -> Dict[str, Any]:
+    payload = {
+        "type": "init",
+        "session_id": current_mind.session_id,
+        "person": current_mind.active_person,
+        "quads_in_kg": current_mind.kg.count_quads(),
+        "turn": current_mind.conversation_turn,
+        "drives": current_mind.drives.to_dict(),
+        "unified_plan": (
+            current_mind.unified_plan.to_dict() if current_mind.unified_plan else {}
+        ),
+        "narrative": (
+            current_mind.unified_plan.narrative.to_dict()
+            if current_mind.unified_plan else {}
+        ),
+        "execution": (
+            current_mind.unified_plan.execution.to_dict()
+            if current_mind.unified_plan else {}
+        ),
+        "last_decision": (
+            current_mind.last_decision.to_dict() if current_mind.last_decision else {}
+        ),
+        "usage_stats": spark_usage_stats(),
+    }
+    payload.update(session_state_snapshot(current_mind))
+    return payload
+
+
 def spark_usage_stats() -> Dict[str, Any]:
     """Return live server/runtime stats for the web UI."""
     usage = llm_client.get_usage_stats() if llm_client else {}
@@ -586,12 +826,35 @@ def spark_usage_stats() -> Dict[str, Any]:
     }
 
 
+async def send_ws_payload(ws: WebSocket, payload: Dict[str, Any]) -> bool:
+    try:
+        await ws.send_text(json.dumps(payload))
+        return True
+    except Exception:
+        if ws in active_websockets:
+            active_websockets.remove(ws)
+        return False
+
+
+async def broadcast_payload(payload: Dict[str, Any]) -> None:
+    for ws in list(active_websockets):
+        await send_ws_payload(ws, payload)
+
+
+async def close_timed_out_session(now: Optional[float] = None) -> bool:
+    if mind is None or not mind.session_timed_out(now=now):
+        return False
+    payload = mind.close_session(reason="inactivity_timeout")
+    if payload:
+        await broadcast_payload(payload)
+    return payload is not None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global mind, drive_task, llm_client
     mind = SophiaMindLive()
     llm_client = get_llm_client()
-    await mind.begin_conversation("David", llm_client=None)
     drive_task = asyncio.create_task(drive_loop())
     logger.info("SPARK server started with drive system active")
     yield
@@ -621,6 +884,10 @@ async def drive_loop():
             await asyncio.sleep(1.0)
             if mind is None:
                 continue
+            if await close_timed_out_session():
+                continue
+            if not mind.session_active:
+                continue
 
             # 1. Tick hierarchical drives
             signal = await mind.drives.tick(
@@ -647,12 +914,7 @@ async def drive_loop():
                     continue
                 mind.mark_self_initiated_dialogue_emitted()
                 msg["usage_stats"] = spark_usage_stats()
-                payload = json.dumps(msg)
-                for ws in list(active_websockets):
-                    try:
-                        await ws.send_text(payload)
-                    except Exception:
-                        active_websockets.remove(ws)
+                await broadcast_payload(msg)
 
             mind.schedule_background_planner(llm_client)
 
@@ -670,29 +932,7 @@ async def websocket_chat(ws: WebSocket):
     logger.info("WebSocket client connected")
 
     # Send initial state
-    await ws.send_text(json.dumps({
-        "type": "init",
-        "session_id": mind.session_id,
-        "person": mind.active_person,
-        "quads_in_kg": mind.kg.count_quads(),
-        "drives": mind.drives.to_dict(),
-        "unified_plan": mind.unified_plan.to_dict() if mind.unified_plan else {},
-        "narrative": (
-            mind.unified_plan.narrative.to_dict() if mind.unified_plan else {}
-        ),
-        "execution": (
-            mind.unified_plan.execution.to_dict() if mind.unified_plan else {}
-        ),
-        "last_decision": mind.last_decision.to_dict() if mind.last_decision else {},
-        "usage_stats": spark_usage_stats(),
-        "self_initiated": {
-            "turns_since_user_input": mind.self_initiated_turns_since_user_input,
-            "dormant": mind.self_initiated_dormant,
-            "next_allowed_in_seconds": max(
-                0.0, mind.next_self_initiated_allowed_at - time.monotonic()
-            ),
-        },
-    }))
+    await send_ws_payload(ws, init_payload(mind))
 
     try:
         while True:
@@ -702,6 +942,12 @@ async def websocket_chat(ws: WebSocket):
             if msg.get("type") == "user_message":
                 text = msg["text"]
                 metadata = websocket_message_metadata(msg)
+                await close_timed_out_session()
+                created_session = await mind.ensure_session_for_message(
+                    text, llm_client=None
+                )
+                if created_session:
+                    await broadcast_payload(init_payload(mind))
                 ctx = await mind.process_message(text, llm_client=None)
                 prompt_payload = render_sophia_prompt(ctx)
                 prompt = prompt_payload["user"]
@@ -773,7 +1019,8 @@ async def websocket_chat(ws: WebSocket):
                     mind.log_response(text)
 
     except WebSocketDisconnect:
-        active_websockets.remove(ws)
+        if ws in active_websockets:
+            active_websockets.remove(ws)
         logger.info("WebSocket client disconnected")
 
 
@@ -785,7 +1032,7 @@ async def root():
 
 @app.get("/api/status")
 async def status():
-    return {
+    snapshot = {
         "session_id": mind.session_id if mind else None,
         "quads_in_kg": mind.kg.count_quads() if mind else 0,
         "drives": mind.drives.to_dict() if mind else {},
@@ -801,14 +1048,9 @@ async def status():
         "topics": mind.topics if mind else [],
         "person": mind.active_person if mind else None,
         "usage_stats": spark_usage_stats(),
-        "self_initiated": {
-            "turns_since_user_input": mind.self_initiated_turns_since_user_input,
-            "dormant": mind.self_initiated_dormant,
-            "next_allowed_in_seconds": max(
-                0.0, mind.next_self_initiated_allowed_at - time.monotonic()
-            ),
-        },
     }
+    snapshot.update(session_state_snapshot(mind))
+    return snapshot
 
 @app.get("/api/kg/recent")
 async def kg_recent(limit: int = 30):
@@ -1256,13 +1498,21 @@ ws.onmessage = (e) => {
   const msg = JSON.parse(e.data);
 
   if (msg.type === 'init') {
-    sessionId = msg.session_id || sessionId;
+    sessionId = msg.session_id || 'none';
     document.getElementById('meta').textContent =
-      `Session: ${sessionId} | Quads: ${msg.quads_in_kg} | Turn: 0`;
+      `Session: ${sessionId} | Quads: ${msg.quads_in_kg} | Turn: ${msg.turn || 0}`;
     updateUsageStats(msg.usage_stats);
     if (msg.drives) updateDrives(msg.drives);
     updatePlannerPanels(msg);
     document.getElementById('unified-plan-view').textContent = pretty(msg.unified_plan);
+  }
+
+  if (msg.type === 'session_closed') {
+    document.getElementById('meta').textContent =
+      `Session: ${msg.session_id || 'none'} | Closed: ${msg.reason || 'unknown'} | Turn: 0`;
+    updateUsageStats(msg.usage_stats);
+    addMsg(`[Session closed after inactivity: ${msg.reason || 'unknown'}]`,
+           'sophia', 'Session');
   }
 
   if (msg.type === 'context_assembled') {

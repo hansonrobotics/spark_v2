@@ -415,7 +415,9 @@ DEFAULT_TEMPLATES = {
 
 class UnifiedPlannerStore:
     def __init__(self, db_path: str):
-        self.conn = sqlite3.connect(db_path)
+        # The live runtime can be driven from FastAPI/TestClient threads that
+        # differ from the thread that created the planner store.
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_db()
 
@@ -535,10 +537,13 @@ class UnifiedPlanner:
         familiarity: float,
         person_history: List[Dict[str, Any]],
         llm_client: Any = None,
+        resume_existing: bool = True,
     ) -> UnifiedPlan:
-        existing = self.store.load_recent_plan(
-            person_id, statuses=["active", "paused", "suspended"]
-        )
+        existing = None
+        if resume_existing:
+            existing = self.store.load_recent_plan(
+                person_id, statuses=["active", "paused", "suspended"]
+            )
         if existing:
             existing.status = "active"
             existing.narrative.status = "active"

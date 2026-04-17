@@ -71,7 +71,7 @@ sqlite_web \
     "$SPARK_DB_PATH" \
     >/tmp/spark-sqlite-web.log 2>&1 &
 
-exec python3.10  -m uvicorn src.runtime.spark_server:app \
+exec python3 -m uvicorn src.runtime.spark_server:app \
     --host 0.0.0.0 \
     --port "$PORT" \
     --log-level "$LOG_LEVEL"

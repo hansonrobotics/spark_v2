@@ -32,9 +32,8 @@ from pydantic import BaseModel
 
 logger = logging.getLogger("spark.htn")
 
-# Late imports to avoid circular deps — resolved at runtime
+# Late import to avoid circular deps — resolved at runtime
 _llm_client = None
-_tkg_bridge = None
 
 def get_llm_client():
     global _llm_client
@@ -42,13 +41,6 @@ def get_llm_client():
         from src.core.llm_client import SparkLLMClient
         _llm_client = SparkLLMClient()
     return _llm_client
-
-def get_tkg_bridge():
-    global _tkg_bridge
-    if _tkg_bridge is None:
-        from src.core.tkg_planning import TKGPlanningBridge
-        _tkg_bridge = TKGPlanningBridge()
-    return _tkg_bridge
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -570,23 +562,16 @@ class AutoresearchPlanner:
             return None
         logger.info(f"AutoresearchPlanner: inventing method for '{task_name}'")
 
-        # Query temporal KG for context that informs invention
-        tkg = get_tkg_bridge()
-        temporal_context = await tkg.get_planning_context(
-            task_name,
-            entity_ids=list(set(["sophia"] + list((context or {}).keys())[:5])),
-        )
-
         program = self._build_invention_prompt(task_def, state, context)
         candidates = await self._generate_candidates(
-            task_def, state, program, temporal_context
+            task_def, state, program
         )
         if not candidates:
             return None
         best_candidate = None
         best_score = -1
         for candidate in candidates:
-            score = await self._evaluate_candidate(candidate, state, temporal_context)
+            score = await self._evaluate_candidate(candidate, state)
             if score > best_score:
                 best_score = score
                 best_candidate = candidate
@@ -595,17 +580,13 @@ class AutoresearchPlanner:
             best_candidate.origin = MethodOrigin.AUTORESEARCH
             best_candidate.created_by = "autoresearch_planner"
             self.registry.add_method(best_candidate)
-            # Log invention to TKG
-            await tkg.log_method_invented(
-                best_candidate.name, task_name, best_score
-            )
             self.invention_log.append({
                 "task": task_name,
                 "method": best_candidate.name,
                 "confidence": best_score,
                 "candidates_evaluated": len(candidates),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "temporal_facts_used": len(temporal_context.get("recent_facts", [])),
+                "temporal_facts_used": 0,
             })
             return best_candidate
         return None
@@ -653,8 +634,7 @@ class AutoresearchPlanner:
 
     async def _generate_candidates(self, task_def: TaskDefinition,
                                      state: WorldState,
-                                     program: str,
-                                     temporal_context: Dict = None) -> List[Method]:
+                                     program: str) -> List[Method]:
         candidates = []
         available = [t.name for t in self.registry.tasks.values()
                      if t.is_primitive and not t.deprecated]
@@ -667,15 +647,13 @@ class AutoresearchPlanner:
             and t.name != task_def.name
         ]
         existing = [m.to_dict() for m in self.registry.get_methods(task_def.name)]
-        temporal_facts = (temporal_context or {}).get("recent_facts", [])
-
         llm_result = await llm.invent_htn_method(
             task_name=task_def.name,
             task_description=task_def.description,
             available_primitives=available,
             available_compounds=available_compounds,
             world_state=state.properties,
-            temporal_context=temporal_facts,
+            temporal_context=[],
             existing_methods=existing,
         )
         if llm_result and isinstance(llm_result, dict):
@@ -755,8 +733,7 @@ class AutoresearchPlanner:
         return variants
 
     async def _evaluate_candidate(self, candidate: Method,
-                                     state: WorldState,
-                                     temporal_context: Dict = None) -> float:
+                                     state: WorldState) -> float:
         score = 0.3
         valid = sum(1 for s in candidate.subtasks
                     if self.registry.get_task(s) is not None)
@@ -770,21 +747,6 @@ class AutoresearchPlanner:
         score += 0.1 * length_pen
         if len(set(candidate.subtasks)) < len(candidate.subtasks) * 0.5:
             score -= 0.2
-
-        # Use LLM judge for higher-confidence evaluation if we have context
-        if temporal_context and candidate.origin == MethodOrigin.LLM_INVENTED:
-            try:
-                llm = get_llm_client()
-                task_def = self.registry.get_task(candidate.task_name)
-                desc = task_def.description if task_def else candidate.task_name
-                llm_score = await llm.evaluate_method_quality(
-                    candidate.to_dict(), desc,
-                    temporal_context.get("recent_facts", [])[:5],
-                )
-                # Blend heuristic and LLM scores
-                score = 0.4 * score + 0.6 * llm_score
-            except Exception:
-                pass  # Fall back to heuristic score
 
         return max(0.0, min(1.0, score))
 
@@ -893,7 +855,6 @@ class DynamicHTNPlanner:
         self.max_depth = 12
         self.max_invention_attempts = 3
         self.allow_invention = True
-        self._use_tkg = True  # Query/write temporal KG during planning
 
     async def plan(self, task_name: str, state: WorldState,
                     params: Optional[Dict[str, Any]] = None,
@@ -909,40 +870,6 @@ class DynamicHTNPlanner:
                 initial_state=dict(state.properties),
                 context=context or {},
             )
-
-            # At top level: enrich state with temporal KG context
-            if self._use_tkg:
-                try:
-                    tkg = get_tkg_bridge()
-                    entity_ids = ["sophia"]
-                    if context:
-                        entity_ids += [v for v in context.values()
-                                       if isinstance(v, str)][:5]
-                    tkg_context = await tkg.get_planning_context(
-                        task_name, entity_ids=entity_ids
-                    )
-                    # Inject temporal signals into world state
-                    recent = tkg_context.get("recent_facts", [])
-                    if recent:
-                        state.set("_tkg_recent_count", len(recent))
-                        # Check if we recently succeeded/failed at this task
-                        task_history = tkg_context.get("task_history", [])
-                        recent_successes = sum(
-                            1 for f in task_history
-                            if "succeeded" in str(f.get("relation", ""))
-                        )
-                        recent_failures = sum(
-                            1 for f in task_history
-                            if "failed" in str(f.get("relation", ""))
-                        )
-                        state.set("_tkg_recent_success_rate",
-                                  recent_successes / max(1, recent_successes + recent_failures))
-                    # Store TKG context for autoresearch to use
-                    if context is None:
-                        context = {}
-                    context["_tkg_planning_context"] = tkg_context
-                except Exception as e:
-                    logger.debug(f"TKG context enrichment skipped: {e}")
 
         # ── Primitive? Execute directly ──
         task_def = self.registry.get_task(task_name)
@@ -1070,40 +997,8 @@ class DynamicHTNPlanner:
                                 context={"goal": goal_description, "tags": tags})
 
     def record_execution_outcome(self, trace: PlanTrace):
-        """Record completed execution for learning + TKG logging."""
+        """Record completed execution for learning."""
         self.learner.observe_outcome(trace)
-        # Async TKG logging — fire and forget
-        if self._use_tkg:
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(self._log_trace_to_tkg(trace))
-                else:
-                    asyncio.run(self._log_trace_to_tkg(trace))
-            except RuntimeError:
-                pass  # No event loop — skip TKG logging
-
-    async def _log_trace_to_tkg(self, trace: PlanTrace):
-        """Write plan trace to temporal KG as quadruples."""
-        try:
-            tkg = get_tkg_bridge()
-            await tkg.log_execution_outcome(
-                task_name=trace.root_task,
-                success=trace.success,
-                execution_time_ms=trace.total_time * 1000,
-                method_name=trace.method_chain[0] if trace.method_chain else "",
-            )
-            if trace.success and trace.primitive_sequence:
-                await tkg.log_plan_created(
-                    trace.root_task,
-                    trace.method_chain[0] if trace.method_chain else "unknown",
-                    trace.primitive_sequence,
-                    trace.trace_id,
-                )
-            await tkg.flush()
-        except Exception as e:
-            logger.debug(f"TKG trace logging failed: {e}")
 
     def get_statistics(self) -> Dict[str, Any]:
         stats = self.registry.get_statistics()

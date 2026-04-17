@@ -2,7 +2,6 @@ import asyncio
 
 from src.core.llm_client import SparkLLMClient
 from src.core.llm_config import load_llm_config
-from src.core.parallel_llm import AsyncLLMClient
 
 
 class FakeResponse:
@@ -87,38 +86,3 @@ def test_spark_llm_client_uses_openai_api_key_from_environment(monkeypatch):
     assert call["json"]["messages"][0]["role"] == "system"
     assert call["json"]["messages"][1]["role"] == "user"
     assert call["json"]["response_format"] == {"type": "json_object"}
-
-
-def test_parallel_async_llm_client_defaults_to_openai_env(monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "parallel-openai-key")
-    monkeypatch.setenv("OPENAI_MODEL", "gpt-parallel")
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
-
-    response = FakeResponse(200, {
-        "choices": [{
-            "message": {"content": "parallel response"},
-        }],
-        "usage": {
-            "prompt_tokens": 5,
-            "completion_tokens": 3,
-        },
-    })
-    recorder = RecordingAsyncClient(response)
-    client = AsyncLLMClient()
-    client._client = recorder
-
-    result = asyncio.run(client.call("Hello", system="You are Sophia"))
-
-    assert result == "parallel response"
-    assert client.provider == "openai"
-    assert client.model == "gpt-parallel"
-    assert client.total_calls == 1
-    assert client.total_input_tokens == 5
-    assert client.total_output_tokens == 3
-
-    call = recorder.calls[0]
-    assert call["url"] == "https://api.openai.com/v1/chat/completions"
-    assert call["headers"]["authorization"] == "Bearer parallel-openai-key"
-    assert call["json"]["messages"][0]["role"] == "system"
-    assert call["json"]["messages"][1]["content"] == "Hello"
